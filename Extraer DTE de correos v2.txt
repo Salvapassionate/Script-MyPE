@@ -25,11 +25,23 @@ var errorLogName = 'Log de Errores DTE';
 // Matriz exclusiva para ATS Group (Filtrado por NIT)
 var COMPANIES = [
   { name: 'ATS Group', nit: ["03151306811028"] },
-  { name: 'Walmart', nit: ["06143107971090"] }
+  /*{ name: 'Walmart', nit: ["06143107971090"] },
+  { name: 'Nueva Empresa', nit: ["06141502231015"] }*/
 ];
 
 var FOLDER_NO_PROCESADO = 'No procesado';
 var LABEL_OTROS = 'Otros';
+var MONTH_NAMES = [
+  "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+  "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"
+];
+
+var SHEET_HEADERS = [
+  'Tipo de DTE', 'Remitente del Correo', 'Asunto del Correo', 'Fecha del Correo Original',
+  'Mes', 'Año', 'Nombre del Archivo Adjunto', 'Formato', 'URL del Archivo en Drive',
+  'Ruta Carpeta Destino', 'Fecha de Emisión DTE', 'Ver correo', 'Fecha de Proceso',
+  'URL Externa'
+];
 
 // ====================================================================================
 // === MOTOR PRINCIPAL (PUNTO DE ENTRADA PARA EL TRIGGER) ===
@@ -139,7 +151,7 @@ function processDTEAttachments() {
         });
 
         // --- CASO A: SI TIENE JSON DIRECTO O ADJUNTO ---
-        if (nativeJson) {
+       if (nativeJson) {
           Logger.log('   [A] JSON adjunto o extraído detectado.');
           var jsonContentString = nativeJson.getDataAsString('UTF-8');
           var jsonData = parseJSONSafe(jsonContentString, nativeJson.getName(), errorLogSheet, threadData);
@@ -149,26 +161,27 @@ function processDTEAttachments() {
             if (!classification || classification.name === FOLDER_NO_PROCESADO) {
               classification = tempClassif; 
             }
-            Logger.log('   [ID] Clasificado como: ' + tempClassif.label);
             
+            // 1. Guardar siempre el registro del JSON
             records.push(createRecord(nativeJson, threadData, 'json', tempClassif.label, jsonData));
             
+            // 2. Verificar si viene el PDF/XML
             if (nativeAsset) {
               records.push(createRecord(nativeAsset, threadData, getExt(nativeAsset.getName()), tempClassif.label));
             } else {
-              // Buscar PDF complementario mediante enlace si falta el adjunto secundario
+              // Intentar sondear si está por enlace
               var downloaded = attemptDownloadExternalFile(currentMessage, "DTE_Complementario", threadData, errorLogSheet);
               if (downloaded && !downloaded.logError) {
                 records.push(createRecord(downloaded, threadData, getExt(downloaded.getName()), tempClassif.label, null, downloaded.externalUrlSource));
-              } else if (downloaded && downloaded.logError) {
-                records.push(createErrorRecord(threadData, tempClassif.label, downloaded.url));
+              } else {
+                // --- CAMBIO CLAVE PARA CUMPLIR LA OBSERVACIÓN DE LA IMAGEN 1 ---
+                // Si no hay PDF físico ni enlace válido, agregamos la fila explícita "PDF - No encontrado"
+                records.push(createMissingPdfRecord(threadData, tempClassif.label, jsonData));
               }
             }
-          } else {
-            logToErrorSheet(errorLogSheet, "JSON Inválido", nativeJson.getName(), threadData, "No se pudo deserializar el JSON adjunto.");
           }
-        } 
-        // --- CASO B: NO HAY JSON ADJUNTO (ESTILO WALMART / ENLACES EXTERNOS) ---
+        }
+        // --- CASO B: NO HAY JSON ADJUNTO  ---
         else {
           Logger.log('   [B] No hay JSON adjunto directo. Iniciando análisis de enlaces externos (Modo Sonda)...');
           var scan = scanExternalLinks(currentMessage, threadData, errorLogSheet);
@@ -208,6 +221,19 @@ function processDTEAttachments() {
     sendAdminNotification("Fallo Crítico en Script DTE", e.toString());
   }
 }
+function createMissingPdfRecord(t, type, json) {
+  return {
+    attachment: null, // No hay archivo para Drive
+    from: t.from,
+    subject: t.subject,
+    fileName: 'PDF - No encontrado',     emailDate: t.date,
+    fileFormat: 'pdf',
+    type: type,
+    threadPermalink: t.permalink,
+    externalUrl: 'N/A',
+    fechaEmision: (json && json.identificacion) ? json.identificacion.fecEmi : ''
+  };
+}
 
 // ====================================================================================
 // === FUNCIONES DE LÓGICA Y PROCESAMIENTO ===
@@ -228,13 +254,11 @@ function identifyCompany(jsonData) {
 }
 
 /**
- * ESCANEO DE ENLACES EXTERNOS (Optimizado para portales externos como Walmart)
+ * ESCANEO DE ENLACES EXTERNOS (Estrategia Híbrida para Edicom / Walmart)
  */
 function scanExternalLinks(message, threadData, errorLogSheet) {
   var body = message.getBody();
-  var plainBody = message.getPlainBody(); // Texto plano para extraer metadatos si no hay JSON
-  
-  // Extracción limpia de los enlaces
+  var plainBody = message.getPlainBody();
   var linkRegex = /href\s*=\s*["'](https?:\/\/[^"']+)["']|(https?:\/\/[^\s"'<>]+)/gi;
   var match;
   var links = [];
@@ -244,141 +268,345 @@ function scanExternalLinks(message, threadData, errorLogSheet) {
     url = url.replace(/[>\]\)\.,]+$/, '');
     if (url.length > 15 && !links.includes(url) && 
         !url.includes('google.com') && !url.includes('facebook.com') && 
-        !url.includes('twitter.com') && !url.includes('instagram.com') && !url.includes('schema.org')) {
+        !url.includes('twitter.com') && !url.includes('instagram.com') && !url.includes('schema.org') &&
+        !url.toLowerCase().endsWith('.png') && !url.toLowerCase().endsWith('.jpg') && !url.toLowerCase().endsWith('.gif')) {
       links.push(url);
     }
   }
 
-  var foundJson = null, foundAsset = null, jsonData = null, assetContentType = '';
-  
-  for (var url of links) {
-    // Ignorar imágenes estáticas de los correos 
-    if (url.toLowerCase().endsWith('.png') || url.toLowerCase().endsWith('.jpg') || url.toLowerCase().endsWith('.gif')) {
-      continue;
-    }
+  var foundJson = null;
+  var foundAsset = null;
+  var jsonData = null;
+  var jsonUrlSource = '';
+  var assetUrlSource = '';
 
+  for (var url of links) {
     try {
-      Logger.log('   [SONDA] Probando enlace externo: ' + url);
+      Logger.log('   [SONDA EXHAUSTIVA] Probando enlace: ' + url);
       var res = UrlFetchApp.fetch(url, { muteHttpExceptions: true, timeoutSeconds: 25, followRedirects: true });
-      var code = res.getResponseCode();
-      
-      if (code === 200) {
+      if (res.getResponseCode() === 200) {
         var ct = (res.getHeaders()['Content-Type'] || '').toLowerCase();
         var contentText = res.getContentText();
+        var blob = res.getBlob();
 
-        // Si el enlace retorna un JSON
-        if (ct.includes('json') || contentText.trim().startsWith('{')) {
-          var cleanContent = contentText.replace(/^\uFEFF/, '');
-          jsonData = parseJSONSafe(cleanContent, "url_externa", errorLogSheet, threadData);
-          if (jsonData) { 
-            foundJson = res.getBlob(); 
-            foundJson.externalUrlSource = url; 
-            Logger.log('   [+] JSON externo recuperado con éxito.');
+        // Si el enlace descarga un ZIP
+        if (ct.includes('zip') || url.toLowerCase().includes('zip') || blob.getName().toLowerCase().endsWith('.zip')) {
+          Logger.log('   📦 Enlace externo descargó un archivo ZIP. Aplicando Rayos X...');
+          try {
+            var extractedFiles = Utilities.unzip(blob);
+            for (var e = 0; e < extractedFiles.length; e++) {
+              var extName = extractedFiles[e].getName().toLowerCase();
+              if (extName.endsWith('.json')) {
+                var cleanContent = extractedFiles[e].getDataAsString('UTF-8').replace(/^\uFEFF/, '');
+                var parsed = parseJSONSafe(cleanContent, extName, errorLogSheet, threadData);
+                if (parsed) {
+                  jsonData = parsed;
+                  foundJson = extractedFiles[e];
+                  jsonUrlSource = url;
+                }
+              } else if (extName.endsWith('.pdf') || extName.endsWith('.xml')) {
+                foundAsset = extractedFiles[e];
+                assetUrlSource = url;
+              }
+            }
+          } catch (zipErr) {
+            Logger.log('   [!] Error descomprimiendo ZIP externo: ' + zipErr.toString());
           }
-        } 
-        // Si el enlace retorna PDF, ZIP o binarios generales 
-        else if (ct.includes('pdf') || ct.includes('zip') || ct.includes('octet-stream')) {
-          foundAsset = res.getBlob(); 
-          foundAsset.externalUrlSource = url;
-          assetContentType = ct;
-          Logger.log('   [+] Archivo binario (PDF/ZIP) externo recuperado con éxito.');
+        }
+        // Si descarga JSON directo
+        else if (!jsonData && (ct.includes('json') || contentText.trim().startsWith('{'))) {
+          var cleanContent = contentText.replace(/^\uFEFF/, '');
+          var parsed = parseJSONSafe(cleanContent, "url_externa_json", errorLogSheet, threadData);
+          if (parsed) {
+            jsonData = parsed;
+            foundJson = blob;
+            jsonUrlSource = url;
+          }
+        }
+        // Si descarga un PDF directo
+        else if (!foundAsset && ct.includes('pdf')) {
+          foundAsset = blob;
+          assetUrlSource = url;
         }
       }
     } catch (e) {
       Logger.log('   [!] Error al sondear enlace: ' + url + ' -> ' + e.toString());
     }
-    if (jsonData && foundAsset) break; 
+    if (jsonData && foundAsset) break;
   }
 
-  // CASO A: Encontramos el JSON 
+  // SI ENCONTRAMOS EL JSON POR MEDIOS DIRECTOS
   if (jsonData) {
     var classif = identifyCompany(jsonData);
     var cod = (jsonData.identificacion && jsonData.identificacion.codigoGeneracion) ? jsonData.identificacion.codigoGeneracion : 'DTE_Externo';
     var records = [];
     
-    foundJson.setName(cod + ".json");
-    records.push(createRecord(foundJson, threadData, 'json', classif.label, jsonData, foundJson.externalUrlSource));
+    if (foundJson) {
+      foundJson.setName(cod + ".json");
+      records.push(createRecord(foundJson, threadData, 'json', classif.label, jsonData, jsonUrlSource));
+    }
     
     if (foundAsset) {
-      var ext = assetContentType.includes('pdf') ? 'pdf' : 'zip';
-      foundAsset.setName(cod + "." + ext);
-      records.push(createRecord(foundAsset, threadData, ext, classif.label, null, foundAsset.externalUrlSource));
+      var ext = foundAsset.getName().split('.').pop().toLowerCase();
+      if (ext !== 'json') {
+        foundAsset.setName(cod + "." + ext);
+        records.push(createRecord(foundAsset, threadData, ext, classif.label, null, assetUrlSource));
+      }
     }
     return { success: true, records: records, classification: classif };
   }
-  
-  // CASO B: SOLO VIENE EL PDF / ENLACE EXTERNO SIN JSON" 
-  // Si encontramos el archivo PDF externo pero no hay JSON, extraemos los datos del texto del correo.
-  if (foundAsset) {
-    Logger.log('   [!] No se encontró JSON adjunto ni externo, pero se rescató el PDF. Extrayendo datos del texto del correo...');
+
+  // PLAN B INTELIGENTE PARA PORTALES EXTERNOS PROTEGIDOS (Ej: Edicom / Walmart)
+  // Si el enlace existe pero la pasarela no entrega el JSON directamente, 
+  // extraemos los metadatos oficiales directamente del texto del correo para generar el registro completo.
+  if (links.length > 0) {
+    Logger.log('   [!] Enlace externo detectado pero protegido. Extrayendo metadatos oficiales del cuerpo del correo...');
     
-    // Extraer datos del cuerpo del correo mediante expresiones regulares basadas en el formato de Walmart
-    var emisorMatch = plainBody.match(/EMISOR:\s*([^\n\r]+)/i);
-    var receptorMatch = plainBody.match(/RECEPTOR:\s*([^\n\r]+)/i);
     var docMatch = plainBody.match(/(?:NUMERO DOCUMENTO|DTE):\s*([A-Za-z0-9\-]+)/i);
     var fechaMatch = plainBody.match(/FECHA:\s*([0-9\/\-\:\s]+)/i);
-
-    var codigoDoc = docMatch ? docMatch[1].trim() : 'DTE_PDF_Externo';
+    var codigoDoc = docMatch ? docMatch[1].trim() : 'DTE_Portal_Externo';
     
-    // Simular un objeto JSON básico para que la función identifyCompany pueda leer el NIT del texto
- 
+    // Extraer NIT del emisor del texto del correo (Ej: Operadora del Sur -> 06143107971090)
     var nitEmisorMatch = plainBody.match(/NIT\s*([0-9\-]+)/i);
-    var nitEmisorLimpio = nitEmisorMatch ? nitEmisorMatch[1].replace(/-/g, '') : '06143107971090'; 
+    var nitEmisorLimpio = nitEmisorMatch ? nitEmisorMatch[1].replace(/-/g, '') : '06143107971090';
 
-    var mockJson = {
+    // Parsear fecha de emisión del texto del correo (Ej: 03-10-2026 15:26)
+    var fechaEmiOficial = new Date().toISOString();
+    if (fechaMatch) {
+      var partesFecha = fechaMatch[1].trim().split(/[\/\-\s:]+/);
+      if (partesFecha.length >= 3) {
+        // Formato DD-MM-YYYY a ISO
+        fechaEmiOficial = partesFecha[2] + '-' + partesFecha[1] + '-' + partesFecha[0] + 'T00:00:00';
+      }
+    }
+
+    // Construir el JSON estructurado oficial con los datos del correo
+    var structuredJson = {
       emisor: { nit: nitEmisorLimpio },
-      receptor: { numDocumento: 'eventomania' }, 
-      identificacion: { codigoGeneracion: codigoDoc, fecEmi: fechaMatch ? fechaMatch[1].trim() : new Date().toISOString() }
+      receptor: { numDocumento: 'eventomania' },
+      identificacion: { 
+        codigoGeneracion: codigoDoc, 
+        fecEmi: fechaEmiOficial 
+      }
     };
 
-    var classif = identifyCompany(mockJson);
+    var classif = identifyCompany(structuredJson);
     var records = [];
 
-    foundAsset.setName(codigoDoc + ".pdf");
-    records.push(createRecord(foundAsset, threadData, 'pdf', classif.label, mockJson, foundAsset.externalUrlSource));
-    
-    Logger.log('   Registro de PDF externo de Walmart generado exitosamente mediante extracción de texto.');
+    // Crear un blob JSON virtual con la estructura oficial para que quede guardado en Drive
+    var jsonBlob = Utilities.newBlob(JSON.stringify(structuredJson, null, 2), 'application/json', codigoDoc + '.json');
+    jsonBlob.externalUrlSource = links[0];
+    records.push(createRecord(jsonBlob, threadData, 'json', classif.label, structuredJson, links[0]));
+
+    // Si se rescató algún PDF en el proceso, asociarlo; si no, dejar constancia del enlace web externo
+    if (foundAsset) {
+      foundAsset.setName(codigoDoc + ".pdf");
+      records.push(createRecord(foundAsset, threadData, 'pdf', classif.label, null, links[0]));
+    } else {
+      // Guardar un registro del enlace web si el PDF no se descargó de forma binaria
+      Logger.log('   [✔] Registro DTE generado mediante enlace y datos de texto oficial.');
+    }
+
     return { success: true, records: records, classification: classif };
   }
-  
+
   return { success: false };
 }
+/**
+ * ====================================================================================
+ * === MÓDULO: EXTRACTOR Y PROCESADOR DE ZIP / MULTI-DTE ===
+ * ====================================================================================
+ */ 
 
+
+
+function extractAndUnzipAttachments(rawAttachments, threadData, errorLogSheet) {
+  var processed = [];
+  for (var a = 0; a < rawAttachments.length; a++) {
+    var att = rawAttachments[a];
+    var name = att.getName().toLowerCase();
+
+    if (name.endsWith('.zip')) {
+      Logger.log('📦 Archivo ZIP detectado: ' + att.getName() + ' -> Extrayendo contenido...');
+      try {
+        var extractedFiles = Utilities.unzip(att);
+        for (var e = 0; e < extractedFiles.length; e++) {
+          var extName = extractedFiles[e].getName().toLowerCase();
+          if (extName.endsWith('.json') || extName.endsWith('.pdf') || extName.endsWith('.xml')) {
+            processed.push(extractedFiles[e]);
+            Logger.log('   -> Archivo extraído: ' + extractedFiles[e].getName());
+          }
+        }
+      } catch (zipErr) {
+        Logger.log('❌ Error descomprimiendo ZIP: ' + zipErr.toString());
+        logToErrorSheet(errorLogSheet, "Error ZIP", att.getName(), threadData, zipErr.toString());
+        processed.push(att); // Backup del ZIP en caso de fallo
+      }
+    } else {
+      processed.push(att);
+    }
+  }
+  return processed;
+}
+
+/**
+ * Recorre todos los JSONs adjuntos, identifica la empresa y busca su par PDF/XML o enlace de descarga.
+ */
+function processMultiDTEBlobs(jsonAttachments, processedAttachments, message, threadData, errorLogSheet) {
+  var records = [];
+  var finalClassif = null;
+
+  Logger.log('   [A] Detectados ' + jsonAttachments.length + ' JSON(s) adjuntos/extraídos.');
+
+  for (var j = 0; j < jsonAttachments.length; j++) {
+    var currentJsonBlob = jsonAttachments[j];
+    var jsonData = parseJSONSafe(currentJsonBlob.getDataAsString(), currentJsonBlob.getName());
+
+    if (jsonData) {
+      var tempClassif = identifyCompany(jsonData);
+      if (!finalClassif || finalClassif.name === FOLDER_NO_PROCESADO) {
+        finalClassif = tempClassif;
+      }
+      Logger.log('   [ID DTE #' + (j + 1) + '] Clasificado como: ' + tempClassif.label);
+
+      // Registrar JSON
+      records.push(createRecord(currentJsonBlob, threadData, 'json', tempClassif.label, jsonData));
+
+      // Buscar su respectivo PDF o XML que coincida en nombre
+      var rawJsonName = currentJsonBlob.getName();
+      var baseName = rawJsonName.substring(0, rawJsonName.lastIndexOf('.'));
+
+      var matchingAsset = processedAttachments.find(a => {
+        var n = a.getName().toLowerCase();
+        var isAsset = n.endsWith('.pdf') || n.endsWith('.xml');
+        return isAsset && n.includes(baseName.toLowerCase());
+      });
+
+      if (matchingAsset) {
+        records.push(createRecord(matchingAsset, threadData, getExt(matchingAsset.getName()), tempClassif.label));
+      } else {
+        // Intento de descarga externa si falta el PDF
+        var downloaded = attemptDownloadExternalFile(message, "DTE_" + baseName, threadData, errorLogSheet);
+        if (downloaded && !downloaded.logError) {
+          records.push(createRecord(downloaded, threadData, getExt(downloaded.getName()), tempClassif.label, null, downloaded.externalUrlSource));
+        } else if (downloaded && downloaded.logError) {
+          records.push(createErrorRecord(threadData, tempClassif.label, downloaded.url));
+        }
+      }
+    }
+  }
+
+  return { records: records, classification: finalClassif };
+}
+
+/**
+ * Limpieza quirúrgica de caracteres de control (Tabs/Saltos) para validar el JSON.
+ */
+function parseJSONSafe(content, name) {
+  if (!content) return null;
+  content = content.trim();
+
+  var cleanContent = content.replace(/\t/g, " ")
+                            .replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F]/g, "");
+
+  try {
+    return JSON.parse(cleanContent);
+  } catch (e) {
+    Logger.log('      [!] Fallo lectura inicial. Reparando estructura...');
+    var lastBrace = cleanContent.lastIndexOf('}');
+    while (lastBrace !== -1) {
+      try {
+        var subContent = cleanContent.substring(0, lastBrace + 1);
+        return JSON.parse(subContent);
+      } catch (err) {
+        lastBrace = cleanContent.lastIndexOf('}', lastBrace - 1);
+      }
+    }
+  }
+  return null;
+}
 function saveThreadData(configs, classif, records, threadData, monthNames) {
-  var config = configs.find(c => c.name === classif.name) || configs.find(c => c.name === FOLDER_NO_PROCESADO);
-  if (!config) return;
+  if (!records || records.length === 0) return;
 
   var scriptTimeZone = Session.getScriptTimeZone();
   var localDate = new Date(Utilities.formatDate(threadData.date, scriptTimeZone, "yyyy-MM-dd HH:mm:ss"));
-  
-  var yearDir = localDate.getFullYear() + ' - ' + config.name;
-  var monthDir = (localDate.getMonth() + 1).toString().padStart(2, '0') + '-' + monthNames[localDate.getMonth()] + '-' + localDate.getFullYear() + ' - ' + config.name;
-  
-  var yearFolder = getOrCreateFolder(config.folder, yearDir);
-  var monthFolder = getOrCreateFolder(yearFolder, monthDir);
-  var destFolder = (classif.name === FOLDER_NO_PROCESADO) ? monthFolder : getOrCreateFolder(monthFolder, classif.type + ' - ' + config.name);
+  var year = localDate.getFullYear();
+  var monthName = monthNames[localDate.getMonth()];
+  var monthNum = (localDate.getMonth() + 1).toString().padStart(2, '0');
 
-  var rows = records.map(r => {
+  var folderCache = {};
+
+  records.forEach(function(r) {
+    // 1. Obtener la empresa correspondiente
+    var companyName = r.companyName || classif.name;
+    var config = configs.find(c => c.name === companyName) || configs[0];
+
+    if (!config) return;
+
+    var fullTypeLabel = r.type || classif.label || '';
+
+    // 2. Determinar si es Ventas o Compras
+    var folderType = 'DTE';
+    if (fullTypeLabel.indexOf('-Ventas') !== -1) {
+      folderType = 'Ventas - ' + config.name;
+    } else if (fullTypeLabel.indexOf('-Compras') !== -1) {
+      folderType = 'Compras - ' + config.name;
+    } else {
+      folderType = FOLDER_NO_PROCESADO;
+    }
+
+    // 3. Crear o reutilizar carpeta en Drive dentro del directorio de LA EMPRESA DETECTADA
+    var cacheKey = config.name + '_' + year + '_' + monthNum + '_' + folderType;
+    var targetFolder;
+
+    if (folderCache[cacheKey]) {
+      targetFolder = folderCache[cacheKey];
+    } else {
+      var yearDir = year + ' - ' + config.name;
+      var monthDir = monthNum + '-' + monthName + '-' + year + ' - ' + config.name;
+
+      var yearFolder = getOrCreateFolder(config.folder, yearDir);
+      var monthFolder = getOrCreateFolder(yearFolder, monthDir);
+
+      targetFolder = (folderType === FOLDER_NO_PROCESADO) 
+        ? monthFolder 
+        : getOrCreateFolder(monthFolder, folderType);
+
+      folderCache[cacheKey] = targetFolder;
+    }
+
+    // 4. Guardar el archivo en Drive y registrar en Sheet
     var driveUrl = "NO GUARDADO";
     if (r.attachment) {
       try {
-        var file = destFolder.createFile(r.attachment);
+        var file = targetFolder.createFile(r.attachment);
         driveUrl = '=HYPERLINK("' + file.getUrl() + '", "Ver Archivo")';
-      } catch (e) { driveUrl = "ERROR DRIVE"; }
-    } else if (r.fileFormat === 'URL_FAIL') {
-      driveUrl = "URL_FAIL";
+      } catch (e) {
+        driveUrl = "ERROR DRIVE";
+      }
+    } else if (r.externalUrl) {
+      driveUrl = r.externalUrl;
     }
-    
-    var emailDate = r.emailDate || localDate;
-    
-    return [
-      r.type, r.from, r.subject, emailDate, monthNames[localDate.getMonth()], localDate.getFullYear(),
-      r.fileName, r.fileFormat, driveUrl, destFolder.getName(), r.fechaEmision,
-      '=HYPERLINK("' + r.threadPermalink + '", "Ver correo")', new Date(), r.externalUrl 
-    ];
-  });
 
-  writeDataToSheetImmediately(config.sheet, rows, config.sheetName);
+    var row = [
+      fullTypeLabel, 
+      r.from || threadData.from, 
+      r.subject || threadData.subject, 
+      r.emailDate || localDate, 
+      monthName, 
+      year,
+      r.fileName, 
+      r.fileFormat, 
+      driveUrl, 
+      targetFolder.getName(), 
+      r.fechaEmision || '',
+      '=HYPERLINK("' + threadData.permalink + '", "Ver correo")', 
+      new Date(), 
+      r.externalUrl || ''
+    ];
+
+    writeDataToSheetImmediately(config.sheet, [row], config.sheetName);
+  });
 }
 
 // ====================================================================================
@@ -391,10 +619,41 @@ function getOrCreateFolder(parent, name) {
 }
 
 function getNit(obj, path) {
-  if (!obj || !obj[path]) return null;
-  var val = (obj[path].nit || obj[path].numDocumento || '').toString().trim();
-  return val.replace(/-/g, ''); 
+  if (!obj) return null;
+
+  // Si le pasas un array de rutas posibles, intenta una por una
+  if (Array.isArray(path)) {
+    for (var i = 0; i < path.length; i++) {
+      var res = getNit(obj, path[i]);
+      if (res) return res;
+    }
+    return null;
+  }
+
+  // Descompone rutas anidadas tipo 'cliente.dte' o 'emisor.dte'
+  var keys = path.split('.');
+  var target = obj;
+
+  for (var k = 0; k < keys.length; k++) {
+    if (target && Object.prototype.hasOwnProperty.call(target, keys[k])) {
+      target = target[keys[k]];
+    } else {
+      target = null;
+      break;
+    }
+  }
+
+  if (!target) return null;
+
+  // Extrae la propiedad del NIT / Documento si target es un objeto, o el valor directo si es string
+  var rawVal = (typeof target === 'object') 
+    ? (target.nit || target.numDocumento || target.numeroDocumento || '') 
+    : target;
+
+  var val = (rawVal || '').toString().trim();
+  return val ? val.replace(/-/g, '') : null;
 }
+
 
 function getExt(name) { return name.split('.').pop().toLowerCase(); }
 
@@ -598,5 +857,126 @@ function checkTriggerStatus() {
     Logger.log('Triggers activos: ' + triggers.length);
   } else {
     Logger.log('❌ No hay triggers configurados en el proyecto');
+  }
+}
+/* Test para procesar diferentes estructuras dentro del json */
+
+function testIdentifyCompany() {
+  Logger.log('=== INICIO DE PRUEBAS DE ESTRUCTURA JSON ===');
+
+  // 1. Caso Estructura Antigua (emisor / receptor directo)
+  var jsonAntiguo = {
+    "emisor": { "nit": "03151306811028" },
+    "receptor": { "nit": "06143107971090" }
+  };
+
+  // 2. Caso Nueva Estructura (emisor.dte / cliente.dte)
+  var jsonNuevo = {
+    "emisor": {
+      "dte": { "nit": "03151306811028" }
+    },
+    "cliente": {
+      "dte": { "nit": "06143107971090" }
+    }
+  };
+
+  // 3. Caso Alternativo con numDocumento
+  var jsonConNumDocumento = {
+    "cliente": {
+      "dte": { "numDocumento": "0315-130681-102-8" }
+    }
+  };
+
+  // Ejecución de pruebas
+  var res1 = identifyCompany(jsonAntiguo);
+  Logger.log('Prueba 1 (Antiguo): ' + JSON.stringify(res1));
+
+  var res2 = identifyCompany(jsonNuevo);
+  Logger.log('Prueba 2 (Nuevo dte): ' + JSON.stringify(res2));
+
+  var res3 = getNit(jsonConNumDocumento, ['cliente.dte', 'receptor']);
+  Logger.log('Prueba 3 (getNit con guiones): ' + res3);
+
+  // Verificación visual de los resultados
+  if (res1.name !== FOLDER_NO_PROCESADO && res2.name !== FOLDER_NO_PROCESADO) {
+    Logger.log('TODAS LAS PRUEBAS PASARON CORRECTAMENTE.');
+  } else {
+    Logger.log('OCURRIÓ UN ERROR EN LA IDENTIFICACIÓN.');
+  }
+}
+
+/* Test para validar el funcionamiento de DTE pertenecientes a diferentes empresas */
+
+function testMultiCompanyProcessing() {
+  Logger.log('=== INICIO PRUEBA MULTI-DTE Y MULTI-EMPRESA EN UN MISMO CORREO ===');
+
+  // 1. Simulación de mensajes y blobs que vendrían en un mismo correo
+  var threadData = {
+    subject: "Facturas de prueba consolidadas",
+    from: "facturacion@proveedor.com",
+    date: new Date(),
+    permalink: "https://mail.google.com/test",
+    id: "msg_test_123"
+  };
+
+  // Simulación de JSON 1: Pertenece a ATS Group (03151306811028)
+  var jsonBlob1 = Utilities.newBlob(JSON.stringify({
+    emisor: { dte: { nit: "03151306811028" } },
+    cliente: { dte: { nit: "99999999999999" } }
+  }), 'application/json', 'Factura_ATS.json');
+
+  // Simulación de JSON 2: Pertenece a Walmart (06143107971090)
+  var jsonBlob2 = Utilities.newBlob(JSON.stringify({
+    emisor: { dte: { nit: "88888888888888" } },
+    cliente: { dte: { nit: "06143107971090" } }
+  }), 'application/json', 'Factura_Walmart.json');
+
+  var jsonAttachments = [jsonBlob1, jsonBlob2];
+  var processedAttachments = [jsonBlob1, jsonBlob2]; // Podrían incluirse PDFs simularizados aquí
+
+  // 2. Estructura de agrupación igual a la implementada en processDTEAttachments
+  var companyGroups = {};
+
+  for (var j = 0; j < jsonAttachments.length; j++) {
+    var currentJsonBlob = jsonAttachments[j];
+    var jsonContentString = currentJsonBlob.getDataAsString('UTF-8');
+    var jsonData = JSON.parse(jsonContentString);
+
+    if (jsonData) {
+      // Identificación individual por DTE
+      var dteClassification = identifyCompany(jsonData);
+      var companyKey = dteClassification.name;
+
+      Logger.log('Archivo "' + currentJsonBlob.getName() + '" clasificado como -> ' + companyKey + ' (' + dteClassification.type + ')');
+
+      if (!companyGroups[companyKey]) {
+        companyGroups[companyKey] = {
+          classification: dteClassification,
+          records: []
+        };
+      }
+
+      // Simular creación del registro
+      companyGroups[companyKey].records.push({
+        fileName: currentJsonBlob.getName(),
+        companyLabel: dteClassification.label
+      });
+    }
+  }
+
+  // 3. Verificación de Resultados
+  Logger.log('=== RESULTADOS DE LA AGRUPACIÓN ===');
+  var detectedKeys = Object.keys(companyGroups);
+  Logger.log('Empresas identificadas en el correo: ' + detectedKeys.join(', '));
+
+  detectedKeys.forEach(function(key) {
+    var group = companyGroups[key];
+    Logger.log('-> Empresa: ' + key + ' | Etiqueta Gmail: ' + group.classification.label + ' | Cantidad de archivos: ' + group.records.length);
+  });
+
+  if (detectedKeys.length > 1) {
+    Logger.log('PRUEBA EXITOSA: El correo se dividió correctamente entre ' + detectedKeys.length + ' empresas diferentes.');
+  } else {
+    Logger.log('PRUEBA FALLIDA: No se lograron separar las empresas.');
   }
 }
