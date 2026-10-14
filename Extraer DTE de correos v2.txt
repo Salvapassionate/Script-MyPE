@@ -18,13 +18,15 @@
 // ====================================================================================
 
 var recipientEmail = 'facturacion.atsgroup@gmail.com'; 
-var dteRootFolderId = '1K-FkPZrk7GsnW_QSMapE1n0OHrjIHjuR'; 
+var dteRootFolderId = '16daw-uuJrzoL0Zn5RQzgE6htjt_NdKtu'; 
 var dteRootFolderName = 'Registros DTE';
 var errorLogName = 'Log de Errores DTE';
 
 // Matriz exclusiva para ATS Group (Filtrado por NIT)
 var COMPANIES = [
-  { name: 'ATS Group', nit: ["03151306811028"] },
+  // Se coloca la informacion de Marlena ya que a su num ID se le aplicaran los filtros por los docs de ejemplo compartidos
+  { name: 'Marlene DTE', nit: ["02073991-2","020739912"] }, 
+ /* { name: 'ATS Group', nit: ["03151306811028"] },
   /*{ name: 'Walmart', nit: ["06143107971090"] },
   { name: 'Nueva Empresa', nit: ["06141502231015"] }*/
 ];
@@ -144,42 +146,56 @@ function processDTEAttachments() {
           }
         }
 
-        var nativeJson = processedAttachments.find(a => a.getName().toLowerCase().endsWith('.json'));
-        var nativeAsset = processedAttachments.find(a => {
+        // --- 1. FILTRAR TODOS LOS JSONs Y ASSETS EXTRAÍDOS ---
+        var nativeJsons = processedAttachments.filter(a => a.getName().toLowerCase().endsWith('.json'));
+        var nativeAssets = processedAttachments.filter(a => {
           var n = a.getName().toLowerCase();
           return n.endsWith('.pdf') || n.endsWith('.xml');
         });
 
-        // --- CASO A: SI TIENE JSON DIRECTO O ADJUNTO ---
-       if (nativeJson) {
-          Logger.log('   [A] JSON adjunto o extraído detectado.');
-          var jsonContentString = nativeJson.getDataAsString('UTF-8');
-          var jsonData = parseJSONSafe(jsonContentString, nativeJson.getName(), errorLogSheet, threadData);
+        // --- CASO A: SI TIENE UNO O MÁS JSONs (DIRECTOS O DENTRO DE ZIP) ---
+        if (nativeJsons.length > 0) {
+          Logger.log('   [A] ' + nativeJsons.length + ' JSON(s) detectado(s). Procesando lote completo...');
           
-          if (jsonData) {
-            var tempClassif = identifyCompany(jsonData);
-            if (!classification || classification.name === FOLDER_NO_PROCESADO) {
-              classification = tempClassif; 
-            }
+          nativeJsons.forEach(function(currentJson) {
+            var jsonContentString = currentJson.getDataAsString('UTF-8');
+            var jsonData = parseJSONSafe(jsonContentString, currentJson.getName(), errorLogSheet, threadData);
             
-            // 1. Guardar siempre el registro del JSON
-            records.push(createRecord(nativeJson, threadData, 'json', tempClassif.label, jsonData));
-            
-            // 2. Verificar si viene el PDF/XML
-            if (nativeAsset) {
-              records.push(createRecord(nativeAsset, threadData, getExt(nativeAsset.getName()), tempClassif.label));
-            } else {
-              // Intentar sondear si está por enlace
-              var downloaded = attemptDownloadExternalFile(currentMessage, "DTE_Complementario", threadData, errorLogSheet);
-              if (downloaded && !downloaded.logError) {
-                records.push(createRecord(downloaded, threadData, getExt(downloaded.getName()), tempClassif.label, null, downloaded.externalUrlSource));
+            if (jsonData) {
+              var tempClassif = identifyCompany(jsonData);
+              if (!classification || classification.name === FOLDER_NO_PROCESADO) {
+                classification = tempClassif; 
+              }
+              
+              // 1. Guardar el registro del JSON actual
+              records.push(createRecord(currentJson, threadData, 'json', tempClassif.label, jsonData));
+              
+              // 2. Buscar el PDF/XML correspondiente que coincida en el nombre base del código de generación
+              var rawJsonName = currentJson.getName().toLowerCase();
+              var baseName = rawJsonName.substring(0, rawJsonName.lastIndexOf('.'));
+              
+              var matchingAsset = nativeAssets.find(a => {
+                return a.getName().toLowerCase().includes(baseName);
+              });
+
+              if (matchingAsset) {
+                records.push(createRecord(matchingAsset, threadData, getExt(matchingAsset.getName()), tempClassif.label));
               } else {
-                // --- CAMBIO CLAVE PARA CUMPLIR LA OBSERVACIÓN DE LA IMAGEN 1 ---
-                // Si no hay PDF físico ni enlace válido, agregamos la fila explícita "PDF - No encontrado"
-                records.push(createMissingPdfRecord(threadData, tempClassif.label, jsonData));
+                // Si no coincide exactamente por nombre, pero solo hay un PDF en el ZIP o mensaje:
+                if (nativeAssets.length === 1 && nativeJsons.length === 1) {
+                  records.push(createRecord(nativeAssets[0], threadData, getExt(nativeAssets[0].getName()), tempClassif.label));
+                } else {
+                  // Intentar sondear si está por enlace externo o marcar como no encontrado
+                  var downloaded = attemptDownloadExternalFile(currentMessage, "DTE_Complementario", threadData, errorLogSheet);
+                  if (downloaded && !downloaded.logError) {
+                    records.push(createRecord(downloaded, threadData, getExt(downloaded.getName()), tempClassif.label, null, downloaded.externalUrlSource));
+                  } else {
+                    records.push(createMissingPdfRecord(threadData, tempClassif.label, jsonData));
+                  }
+                }
               }
             }
-          }
+          });
         }
         // --- CASO B: NO HAY JSON ADJUNTO  ---
         else {
