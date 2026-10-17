@@ -1,0 +1,1217 @@
+/**
+ * ====================================================================================
+ * SCRIPT DE EXTRACCIÓN Y ORGANIZACIÓN DE DTE DESDE GMAIL (GOOGLE APPS SCRIPT) - v3
+ * ====================================================================================
+ *
+ * ¿QUÉ HACE ESTE SCRIPT?
+ * Revisa la bandeja de entrada de Gmail, encuentra los Documentos Tributarios Electrónicos (DTE
+ * de El Salvador) que llegan por correo, los guarda ordenados en Google Drive y deja un registro
+ * de cada archivo en una hoja de cálculo por empresa.
+ *
+ * FLUJO GENERAL (función de entrada: processDTEAttachments, pensada para un trigger por tiempo):
+ *  1. Busca hilos nuevos: "in:inbox has:nouserlabels" (los ya procesados quedan con etiqueta).
+ *  2. Por cada mensaje obtiene los adjuntos; si hay .zip los descomprime en memoria y toma los
+ *     .json / .pdf / .xml 
+ *  3. Si hay JSON: lo lee (reparándolo si viene roto), identifica la empresa por NIT (emisor =
+ *     Ventas, receptor = Compras) y busca su PDF/XML pareja por nombre o por enlace externo.
+ *  4. Si NO hay JSON adjunto: sondea los enlaces del correo (portales tipo Walmart/Edicom) para
+ *     descargar JSON/PDF/ZIP; si el portal está protegido usa los datos del texto del correo.
+ *  5. Valida SIEMPRE la pareja PDF + JSON: si falta uno deja un registro "PDF - No encontrado" o
+ *     "JSON - No encontrado" indicando de qué archivo recibido es contraparte (y lo anota en el log).
+ *  6. ANTI-DUPLICADOS: antes de guardar, verifica por Código de Generación + formato si ese archivo
+ *     ya fue registrado; si ya existe lo omite (no lo sube a Drive ni agrega fila). Ver módulo
+ *     "ANTI-DUPLICADOS" más abajo.
+ *  7. Guarda los archivos en Drive: <Empresa>/<Año - Empresa>/<MM-Mes-Año - Empresa>/<Compras|Ventas - Empresa>
+ *     y agrega una fila por archivo en "<Empresa> - Registros DTE". Lo no identificado va a "No procesado".
+ *  8. Etiqueta el hilo en Gmail (<Empresa>-Compras / -Ventas / No procesado / Otros) para no reprocesarlo.
+ *
+ * SALIDAS:
+ *  - Archivos en Drive en carpeta raíz
+ *  - Una hoja "<Empresa> - Registros DTE" por empresa (columnas en SHEET_HEADERS).
+ *  - Hoja "Log de Errores DTE": errores de ZIP, JSON corruptos, fallos de descarga, faltantes de
+ *    pareja y duplicados omitidos.
+ *  - Correo de alerta al administrador solo ante un fallo crítico general.
+ *
+ * CONFIGURACIÓN (sección CONFIGURACIÓN GLOBAL): empresas y NITs en COMPANIES, carpeta raíz,
+ *  correo del administrador y la opción ORPHAN_REQUIRE_DTE_NAME.
+ *
+ * PROTECCIONES: bloqueo (LockService) para que no corran dos ejecuciones a la vez, corte seguro
+ *  por tiempo, reintentos al escribir en la hoja y limpieza de JSONs con caracteres inválidos.
+ *
+ * HISTORIAL DE CAMBIOS (buscar "[CAMBIO v3" en el código):
+ *  - v3: el PDF/XML encontrado hereda la "Fecha de Emisión DTE" de su JSON.
+ *  - v3 :se quita la ruta interna del ZIP en el nombre de archivo (cleanFileName).
+ *  - v3 : validación de pareja PDF + JSON con registro de faltantes.
+ *  - v3 : control de duplicados por Código de Generación, nueva columna "Código de Generación"
+ *    y bloqueo de ejecuciones simultáneas.
+ */
+
+// ====================================================================================
+// === CONFIGURACIÓN GLOBAL ===
+// ====================================================================================
+
+var recipientEmail = 'facturacion.atsgroup@gmail.com'; 
+var dteRootFolderId = '10z96hTPJyczJD9e--FFHWk1b19rFqIfl'; 
+var dteRootFolderName = 'Registros DTE';
+var errorLogName = 'Log de Errores DTE';
+
+// [CAMBIO v3 - Consulta 4] Un PDF/XML recibido SIN JSON solo se registra como "JSON - No encontrado"
+// si su nombre parece un DTE (contiene un código de generación tipo GUID). Así no se registran
+// PDFs ajenos (logos, brochures, etc.). Poner en false para registrar CUALQUIER PDF/XML huérfano.
+var ORPHAN_REQUIRE_DTE_NAME = true;
+
+// Matriz exclusiva para ATS Group (Filtrado por NIT)
+var COMPANIES = [
+  // Se coloca la informacion de Marlena ya que a su num ID se le aplicaran los filtros por los docs de ejemplo compartidos
+  { name: 'Marlene DTE', nit: ["02073991-2","020739912"] }, 
+ /* { name: 'ATS Group', nit: ["03151306811028"] },
+  /*{ name: 'Walmart', nit: ["06143107971090"] },
+  { name: 'Nueva Empresa', nit: ["06141502231015"] }*/
+];
+
+var FOLDER_NO_PROCESADO = 'No procesado';
+var LABEL_OTROS = 'Otros';
+var MONTH_NAMES = [
+  "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+  "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"
+];
+
+// [CAMBIO v3.3] Se agregó la columna 15 'Código de Generación' (clave del control de duplicados).
+var SHEET_HEADERS = [
+  'Tipo de DTE', 'Remitente del Correo', 'Asunto del Correo', 'Fecha del Correo Original',
+  'Mes', 'Año', 'Nombre del Archivo Adjunto', 'Formato', 'URL del Archivo en Drive',
+  'Ruta Carpeta Destino', 'Fecha de Emisión DTE', 'Ver correo', 'Fecha de Proceso',
+  'URL Externa', 'Código de Generación'
+];
+
+// ====================================================================================
+// === MOTOR PRINCIPAL (PUNTO DE ENTRADA PARA EL TRIGGER) ===
+// ====================================================================================
+
+/**
+ * MOTOR PRINCIPAL. Punto de entrada para el trigger. Recorre los hilos nuevos de Gmail, extrae/descomprime adjuntos,
+ * empareja JSON + PDF, clasifica por empresa, guarda en Drive/Sheets (sin duplicados) y etiqueta el hilo.
+ * Tiene bloqueo anti-simultaneidad y corte seguro por tiempo.
+ */
+function processDTEAttachments() {
+  var startTime = new Date().getTime();
+  var MAX_EXECUTION_TIME = 5 * 60 * 1000; // Límite de 5 minutos
+  var SAFETY_MARGIN = 30 * 1000; // Margen de seguridad de 30 segundos
+  
+  // Devuelve true cuando se acerca el límite de tiempo de ejecución, para cortar de forma segura
+  function shouldStopExecution() {
+    return (new Date().getTime() - startTime) > (MAX_EXECUTION_TIME - SAFETY_MARGIN);
+  }
+
+  var monthNames = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+                    "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"];
+  
+  // [CAMBIO v3.3] Se usa la lista global (antes había una copia local que podía desincronizarse)
+  var sheetHeaders = SHEET_HEADERS;
+
+  // [CAMBIO v3.3] Bloqueo: evita que dos ejecuciones simultáneas procesen los mismos correos y generen duplicados
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) {
+    Logger.log('>>> [BLOQUEO] Ya hay otra ejecución en curso. Se cancela esta para evitar duplicados.');
+    return;
+  }
+
+  try {
+    Logger.log('>>> [INICIO] Ejecutando motor optimizado DTE (Soporte Walmart, JSONs y Zips)');
+    
+    var dteMainFolder;
+    try {
+      dteMainFolder = DriveApp.getFolderById(dteRootFolderId);
+    } catch (e) {
+      Logger.log('ERROR CRÍTICO: Carpeta raíz inaccesible - ID: ' + dteRootFolderId);
+      throw e;
+    }
+
+    var allLabels = setupLabels();
+    var configs = setupCompanyConfigs(dteMainFolder, sheetHeaders);
+    var errorLogSheet = setupErrorLog(dteMainFolder);
+
+    // Buscar hilos sin etiquetas (nuevos)
+    var threads = GmailApp.search("in:inbox has:nouserlabels");
+    Logger.log('>>> [BANDEJA] ' + threads.length + ' hilos de correo por procesar.');
+
+    var stats = { processed: 0, files: 0, duplicates: 0, others: 0, executionStopped: false }; // [CAMBIO v3.3] + duplicates
+
+    for (var i = 0; i < threads.length; i++) {
+      if (shouldStopExecution()) {
+        stats.executionStopped = true;
+        Logger.log('>>> [CRONÓMETRO] Límite de tiempo alcanzado. Deteniendo ejecución de forma segura...');
+        break;
+      }
+
+      var thread = threads[i];
+      var threadMessages = thread.getMessages();
+      var threadPermalink = thread.getPermalink();
+      var classification = null;
+      var records = [];
+
+      for (var msgIndex = 0; msgIndex < threadMessages.length; msgIndex++) {
+        var currentMessage = threadMessages[msgIndex];
+        var threadData = {
+          subject: currentMessage.getSubject(),
+          from: currentMessage.getFrom(),
+          date: currentMessage.getDate(),
+          permalink: threadPermalink,
+          id: currentMessage.getId()
+        };
+        
+        Logger.log('ANALIZANDO MSG [' + msgIndex + ']: "' + threadData.subject + '" de ' + threadData.from);
+
+        var rawAttachments = currentMessage.getAttachments();
+        var processedAttachments = [];
+        
+        // --- 1. PROCESAMIENTO DE ADJUNTOS Y DESCOMPRESIÓN ZIP ---
+        for (var a = 0; a < rawAttachments.length; a++) {
+          var att = rawAttachments[a];
+          var name = att.getName().toLowerCase();
+          
+          if (name.endsWith('.zip')) {
+            Logger.log('📦 Archivo ZIP detectado: ' + att.getName() + ' -> Extrayendo contenido en memoria...');
+            try {
+              var extractedFiles = Utilities.unzip(att);
+              for (var e = 0; e < extractedFiles.length; e++) {
+                var extractedName = extractedFiles[e].getName().toLowerCase();
+                // Solo nos interesan los JSON, PDF o XML de adentro del ZIP
+                if (extractedName.endsWith('.json') || extractedName.endsWith('.pdf') || extractedName.endsWith('.xml')) {
+                  // [CAMBIO v3 - Consulta 2] Utilities.unzip() devuelve el nombre con la ruta interna del ZIP
+                  // (ej. "carpeta/archivo.pdf"). Se deja solo el nombre del archivo.
+                  extractedFiles[e].setName(cleanFileName(extractedFiles[e].getName()));
+                  processedAttachments.push(extractedFiles[e]);
+                  Logger.log('    -> Archivo extraído exitosamente: ' + extractedFiles[e].getName());
+                }
+              }
+            } catch (zipErr) {
+              Logger.log('❌ Error descomprimiendo ZIP: ' + zipErr.toString());
+              logToErrorSheet(errorLogSheet, "Error ZIP", att.getName(), threadData, zipErr.toString());
+               // En caso de fallo, metemos el ZIP original por si queremos guardarlo como backup
+              processedAttachments.push(att); 
+            }
+          } else {
+             // No es ZIP, pasa directo a la lista
+            processedAttachments.push(att);
+          }
+        }
+
+        // --- 1. FILTRAR TODOS LOS JSONs Y ASSETS EXTRAÍDOS ---
+        var nativeJsons = processedAttachments.filter(a => a.getName().toLowerCase().endsWith('.json'));
+        var nativeAssets = processedAttachments.filter(a => {
+          var n = a.getName().toLowerCase();
+          return n.endsWith('.pdf') || n.endsWith('.xml');
+        });
+
+        // --- CASO A: SI TIENE UNO O MÁS JSONs (DIRECTOS O DENTRO DE ZIP) ---
+        // [CAMBIO v3 - Consulta 4] Se lleva control de los PDF/XML que ya fueron emparejados con un JSON
+        var usedAssets = [];
+
+        if (nativeJsons.length > 0) {
+          Logger.log('   [A] ' + nativeJsons.length + ' JSON(s) detectado(s). Procesando lote completo...');
+          
+          nativeJsons.forEach(function(currentJson) {
+            var jsonContentString = currentJson.getDataAsString('UTF-8');
+            var jsonData = parseJSONSafe(jsonContentString, currentJson.getName(), errorLogSheet, threadData);
+            
+            if (jsonData) {
+              var tempClassif = identifyCompany(jsonData);
+              if (!classification || classification.name === FOLDER_NO_PROCESADO) {
+                classification = tempClassif; 
+              }
+              
+              // 1. Guardar el registro del JSON actual
+              records.push(createRecord(currentJson, threadData, 'json', tempClassif.label, jsonData));
+              
+              // 2. Buscar el PDF/XML correspondiente que coincida en el nombre base del código de generación
+              // [CAMBIO v3 - Consulta 2] se compara con el nombre limpio (sin ruta de carpeta del ZIP)
+              var rawJsonName = cleanFileName(currentJson.getName()).toLowerCase();
+              var baseName = rawJsonName.substring(0, rawJsonName.lastIndexOf('.'));
+              
+              var matchingAsset = nativeAssets.find(a => {
+                return cleanFileName(a.getName()).toLowerCase().includes(baseName);
+              });
+
+              // Si no coincide exactamente por nombre, pero solo hay un PDF y un JSON en el mensaje/ZIP:
+              if (!matchingAsset && nativeAssets.length === 1 && nativeJsons.length === 1) {
+                matchingAsset = nativeAssets[0];
+              }
+
+              if (matchingAsset) {
+                usedAssets.push(matchingAsset);
+                // [CAMBIO v3 - Consulta 1] Se pasa jsonData para que el PDF/XML encontrado
+                // herede la "Fecha de Emisión DTE" de su JSON (antes quedaba vacía).
+                records.push(createRecord(matchingAsset, threadData, getExt(matchingAsset.getName()), tempClassif.label, jsonData));
+              } else {
+                // Intentar sondear si está por enlace externo o marcar como no encontrado
+                var downloaded = attemptDownloadExternalFile(currentMessage, "DTE_Complementario", threadData, errorLogSheet);
+                // [CAMBIO v3 - Consulta 4] Solo se acepta como pareja si NO es una página HTML
+                // (una página web no es el PDF del DTE).
+                if (downloaded && !downloaded.logError && getExt(downloaded.getName()) !== 'html') {
+                  // [CAMBIO v3 - Consulta 1] se pasa jsonData para heredar la fecha de emisión
+                  records.push(createRecord(downloaded, threadData, getExt(downloaded.getName()), tempClassif.label, jsonData, downloaded.externalUrlSource));
+                } else {
+                  // [CAMBIO v3 - Consulta 4] Falta el PDF: se deja registro indicando de qué JSON es contraparte
+                  var triedUrl = downloaded ? (downloaded.externalUrlSource || downloaded.url || '') : '';
+                  records.push(buildMissingCounterpartRecord(threadData, tempClassif.label, 'PDF', currentJson.getName(), jsonData, errorLogSheet, triedUrl));
+                }
+              }
+            }
+          });
+
+          // [CAMBIO v3 - Consulta 4] PDF/XML que quedaron SIN su JSON contraparte
+          var orphanA = registerOrphanAssets(nativeAssets, usedAssets, threadData, classification, errorLogSheet);
+          records = records.concat(orphanA.records);
+          classification = orphanA.classification;
+        }
+        // --- CASO B: NO HAY JSON ADJUNTO  ---
+        else {
+          Logger.log('   [B] No hay JSON adjunto directo. Iniciando análisis de enlaces externos (Modo Sonda)...');
+          var scan = scanExternalLinks(currentMessage, threadData, errorLogSheet);
+          if (scan.success) {
+            records = records.concat(scan.records);
+            if (!classification || classification.name === FOLDER_NO_PROCESADO) {
+              classification = scan.classification;
+            }
+          } else if (nativeAssets.length > 0) {
+            // [CAMBIO v3 - Consulta 4] Hay PDF/XML adjunto, no hay JSON adjunto ni se obtuvo por enlace:
+            // antes se ignoraba por completo; ahora se registra indicando que falta el JSON.
+            var orphanB = registerOrphanAssets(nativeAssets, [], threadData, classification, errorLogSheet);
+            records = records.concat(orphanB.records);
+            classification = orphanB.classification;
+          }
+        }
+      } // Fin bucle mensajes
+
+      if (classification && records.length > 0) {
+        var baseThreadData = {
+            subject: threadMessages[0].getSubject(),
+            from: threadMessages[0].getFrom(),
+            date: threadMessages[0].getDate(),
+            permalink: threadPermalink
+        };
+        // [CAMBIO v3.3] saveThreadData ahora omite duplicados y devuelve cuántos guardó y cuántos omitió.
+        // El hilo se etiqueta igual aunque todo sea duplicado, para no reprocesarlo en cada ejecución.
+        var saveResult = saveThreadData(configs, classification, records, baseThreadData, monthNames, errorLogSheet);
+        thread.addLabel(allLabels[classification.label]);
+        stats.processed++;
+        stats.files += saveResult.saved;
+        stats.duplicates += saveResult.duplicates;
+        Logger.log('>>> [OK] Hilo procesado. Guardados: ' + saveResult.saved + ' | Duplicados omitidos: ' + saveResult.duplicates);
+      } else {
+        thread.addLabel(allLabels[LABEL_OTROS]);
+        stats.others++;
+        Logger.log('>>> [SKIP] Hilo sin documentos DTE válidos identificados.');
+      }
+    }
+
+    SpreadsheetApp.flush();
+    Logger.log('>>> [FIN] Procesamiento finalizado. Procesados: ' + stats.processed + ' | Archivos guardados: ' + stats.files + ' | Duplicados omitidos: ' + stats.duplicates + ' | Otros: ' + stats.others);
+
+  } catch (e) {
+    Logger.log('>>> [ERROR CRÍTICO GENERAL] ' + e.toString());
+    sendAdminNotification("Fallo Crítico en Script DTE", e.toString());
+  } finally {
+    // [CAMBIO v3.3] Liberar siempre el bloqueo, haya o no error
+    lock.releaseLock();
+  }
+}
+/**
+ * [CAMBIO v3 - Consulta 4] Reemplaza a createMissingPdfRecord().
+ * Genera el registro "PDF - No encontrado" o "JSON - No encontrado" según el formato que falte,
+ * indicando de qué archivo recibido es contraparte, y deja constancia en el Log de Errores DTE.
+ *
+ * @param t                 threadData del correo
+ * @param type              etiqueta de clasificación (ej. 'Marlene DTE-Compras')
+ * @param missingFormat     'PDF' o 'JSON' (el que NO se encontró)
+ * @param receivedFileName  nombre del archivo que SÍ se recibió (la contraparte)
+ * @param json              JSON ya leído (si existe) para tomar la fecha de emisión
+ * @param errorLogSheet     hoja de log de errores (opcional)
+ * @param extUrl            URL externa intentada (opcional)
+ */
+function buildMissingCounterpartRecord(t, type, missingFormat, receivedFileName, json, errorLogSheet, extUrl) {
+  var fmt = missingFormat.toUpperCase();
+  var received = cleanFileName(receivedFileName);
+  Logger.log('   [!] Falta ' + fmt + ' contraparte de: ' + received);
+
+  if (errorLogSheet) {
+    logToErrorSheet(errorLogSheet, 'Falta contraparte ' + fmt, received, t,
+      'Se recibió "' + received + '" pero no se encontró su ' + fmt + ' correspondiente.');
+  }
+
+  return {
+    attachment: null, // No hay archivo para Drive
+    from: t.from,
+    subject: t.subject,
+    fileName: fmt + ' - No encontrado (contraparte de: ' + received + ')',
+    emailDate: t.date,
+    fileFormat: fmt.toLowerCase(),
+    type: type,
+    threadPermalink: t.permalink,
+    externalUrl: extUrl || 'N/A',
+    // La fecha de emisión sale del JSON (identificacion.fecEmi). Si falta el JSON queda vacía.
+    fechaEmision: (json && json.identificacion) ? json.identificacion.fecEmi : '',
+    // [CAMBIO v3.3] Código para deduplicar y marca para distinguir este registro "faltante" de un archivo real
+    codigo: getCodigoGeneracion(json) || extractGuidFromName(receivedFileName),
+    isMissing: true
+  };
+}
+
+/**
+ * [CAMBIO v3 - Consulta 4] Registra los PDF/XML que llegaron sin JSON contraparte.
+ * Por cada uno genera: (1) el registro del archivo recibido y (2) "JSON - No encontrado".
+ * Si no hay clasificación (no hay JSON que la determine) se envía a "No procesado".
+ */
+function registerOrphanAssets(assets, usedAssets, threadData, classification, errorLogSheet) {
+  var orphanRecords = [];
+  var finalClassif = classification;
+
+  assets.forEach(function(asset) {
+    if (usedAssets.indexOf(asset) !== -1) return; // ya emparejado con un JSON
+
+    var cleanName = cleanFileName(asset.getName());
+    if (ORPHAN_REQUIRE_DTE_NAME && !looksLikeDteName(cleanName)) {
+      Logger.log('   [i] Archivo "' + cleanName + '" ignorado (no parece un DTE y no tiene JSON contraparte).');
+      return;
+    }
+
+    if (!finalClassif) {
+      finalClassif = { name: FOLDER_NO_PROCESADO, type: 'DTE', label: FOLDER_NO_PROCESADO };
+    }
+
+    orphanRecords.push(createRecord(asset, threadData, getExt(asset.getName()), finalClassif.label));
+    orphanRecords.push(buildMissingCounterpartRecord(threadData, finalClassif.label, 'JSON', asset.getName(), null, errorLogSheet));
+  });
+
+  return { records: orphanRecords, classification: finalClassif };
+}
+
+// ====================================================================================
+// === FUNCIONES DE LÓGICA Y PROCESAMIENTO ===
+// ====================================================================================
+
+/**
+ * Identifica a qué empresa de COMPANIES pertenece el DTE comparando el NIT del emisor (=> Ventas) y del receptor
+ * (=> Compras). Si no coincide ninguna devuelve la clasificación "No procesado".
+ */
+function identifyCompany(jsonData) {
+  var emisor = getNit(jsonData, 'emisor') || getNit(jsonData, 'donante');
+  var receptor = getNit(jsonData, 'receptor') || getNit(jsonData, 'donatario') || getNit(jsonData, 'documento');
+  
+  for (var i = 0; i < COMPANIES.length; i++) {
+    var c = COMPANIES[i];
+    var nitList = Array.isArray(c.nit) ? c.nit : [c.nit];
+    
+    if (nitList.indexOf(emisor) !== -1) return { name: c.name, type: 'Ventas', label: c.name + '-Ventas' };
+    if (nitList.indexOf(receptor) !== -1) return { name: c.name, type: 'Compras', label: c.name + '-Compras' };
+  }
+  return { name: FOLDER_NO_PROCESADO, type: 'DTE', label: FOLDER_NO_PROCESADO };
+}
+
+/**
+ * ESCANEO DE ENLACES EXTERNOS (Estrategia Híbrida para Edicom / Walmart)
+ */
+function scanExternalLinks(message, threadData, errorLogSheet) {
+  var body = message.getBody();
+  var plainBody = message.getPlainBody();
+  var linkRegex = /href\s*=\s*["'](https?:\/\/[^"']+)["']|(https?:\/\/[^\s"'<>]+)/gi;
+  var match;
+  var links = [];
+  
+  while ((match = linkRegex.exec(body)) !== null) {
+    var url = match[1] || match[2];
+    url = url.replace(/[>\]\)\.,]+$/, '');
+    if (url.length > 15 && !links.includes(url) && 
+        !url.includes('google.com') && !url.includes('facebook.com') && 
+        !url.includes('twitter.com') && !url.includes('instagram.com') && !url.includes('schema.org') &&
+        !url.toLowerCase().endsWith('.png') && !url.toLowerCase().endsWith('.jpg') && !url.toLowerCase().endsWith('.gif')) {
+      links.push(url);
+    }
+  }
+
+  var foundJson = null;
+  var foundAsset = null;
+  var jsonData = null;
+  var jsonUrlSource = '';
+  var assetUrlSource = '';
+
+  for (var url of links) {
+    try {
+      Logger.log('   [SONDA EXHAUSTIVA] Probando enlace: ' + url);
+      var res = UrlFetchApp.fetch(url, { muteHttpExceptions: true, timeoutSeconds: 25, followRedirects: true });
+      if (res.getResponseCode() === 200) {
+        var ct = (res.getHeaders()['Content-Type'] || '').toLowerCase();
+        var contentText = res.getContentText();
+        var blob = res.getBlob();
+
+        // Si el enlace descarga un ZIP
+        if (ct.includes('zip') || url.toLowerCase().includes('zip') || blob.getName().toLowerCase().endsWith('.zip')) {
+          Logger.log('   📦 Enlace externo descargó un archivo ZIP. Aplicando Rayos X...');
+          try {
+            var extractedFiles = Utilities.unzip(blob);
+            for (var e = 0; e < extractedFiles.length; e++) {
+              var extName = extractedFiles[e].getName().toLowerCase();
+              if (extName.endsWith('.json')) {
+                var cleanContent = extractedFiles[e].getDataAsString('UTF-8').replace(/^\uFEFF/, '');
+                var parsed = parseJSONSafe(cleanContent, extName, errorLogSheet, threadData);
+                if (parsed) {
+                  jsonData = parsed;
+                  foundJson = extractedFiles[e];
+                  jsonUrlSource = url;
+                }
+              } else if (extName.endsWith('.pdf') || extName.endsWith('.xml')) {
+                foundAsset = extractedFiles[e];
+                assetUrlSource = url;
+              }
+            }
+          } catch (zipErr) {
+            Logger.log('   [!] Error descomprimiendo ZIP externo: ' + zipErr.toString());
+          }
+        }
+        // Si descarga JSON directo
+        else if (!jsonData && (ct.includes('json') || contentText.trim().startsWith('{'))) {
+          var cleanContent = contentText.replace(/^\uFEFF/, '');
+          var parsed = parseJSONSafe(cleanContent, "url_externa_json", errorLogSheet, threadData);
+          if (parsed) {
+            jsonData = parsed;
+            foundJson = blob;
+            jsonUrlSource = url;
+          }
+        }
+        // Si descarga un PDF directo
+        else if (!foundAsset && ct.includes('pdf')) {
+          foundAsset = blob;
+          assetUrlSource = url;
+        }
+      }
+    } catch (e) {
+      Logger.log('   [!] Error al sondear enlace: ' + url + ' -> ' + e.toString());
+    }
+    if (jsonData && foundAsset) break;
+  }
+
+  // SI ENCONTRAMOS EL JSON POR MEDIOS DIRECTOS
+  if (jsonData) {
+    var classif = identifyCompany(jsonData);
+    var cod = (jsonData.identificacion && jsonData.identificacion.codigoGeneracion) ? jsonData.identificacion.codigoGeneracion : 'DTE_Externo';
+    var records = [];
+    
+    if (foundJson) {
+      foundJson.setName(cod + ".json");
+      records.push(createRecord(foundJson, threadData, 'json', classif.label, jsonData, jsonUrlSource));
+    }
+    
+    if (foundAsset) {
+      var ext = foundAsset.getName().split('.').pop().toLowerCase();
+      if (ext !== 'json') {
+        foundAsset.setName(cod + "." + ext);
+        // [CAMBIO v3 - Consulta 1] se pasa jsonData (antes null) para heredar la fecha de emisión
+        records.push(createRecord(foundAsset, threadData, ext, classif.label, jsonData, assetUrlSource));
+      }
+    } else {
+      // [CAMBIO v3 - Consulta 4] Se obtuvo el JSON pero no el PDF/XML: se deja registro
+      records.push(buildMissingCounterpartRecord(threadData, classif.label, 'PDF', cod + ".json", jsonData, errorLogSheet, jsonUrlSource));
+    }
+    return { success: true, records: records, classification: classif };
+  }
+
+  // PLAN B INTELIGENTE PARA PORTALES EXTERNOS PROTEGIDOS (Ej: Edicom / Walmart)
+  // Si el enlace existe pero la pasarela no entrega el JSON directamente, 
+  // extraemos los metadatos oficiales directamente del texto del correo para generar el registro completo.
+  if (links.length > 0) {
+    Logger.log('   [!] Enlace externo detectado pero protegido. Extrayendo metadatos oficiales del cuerpo del correo...');
+    
+    var docMatch = plainBody.match(/(?:NUMERO DOCUMENTO|DTE):\s*([A-Za-z0-9\-]+)/i);
+    var fechaMatch = plainBody.match(/FECHA:\s*([0-9\/\-\:\s]+)/i);
+    var codigoDoc = docMatch ? docMatch[1].trim() : 'DTE_Portal_Externo';
+    
+    // Extraer NIT del emisor del texto del correo (Ej: Operadora del Sur -> 06143107971090)
+    var nitEmisorMatch = plainBody.match(/NIT\s*([0-9\-]+)/i);
+    var nitEmisorLimpio = nitEmisorMatch ? nitEmisorMatch[1].replace(/-/g, '') : '06143107971090';
+
+    // Parsear fecha de emisión del texto del correo (Ej: 03-10-2026 15:26)
+    var fechaEmiOficial = new Date().toISOString();
+    if (fechaMatch) {
+      var partesFecha = fechaMatch[1].trim().split(/[\/\-\s:]+/);
+      if (partesFecha.length >= 3) {
+        // Formato DD-MM-YYYY a ISO
+        fechaEmiOficial = partesFecha[2] + '-' + partesFecha[1] + '-' + partesFecha[0] + 'T00:00:00';
+      }
+    }
+
+    // Construir el JSON estructurado oficial con los datos del correo
+    var structuredJson = {
+      emisor: { nit: nitEmisorLimpio },
+      receptor: { numDocumento: 'eventomania' },
+      identificacion: { 
+        codigoGeneracion: codigoDoc, 
+        fecEmi: fechaEmiOficial 
+      }
+    };
+
+    var classif = identifyCompany(structuredJson);
+    var records = [];
+
+    // Crear un blob JSON virtual con la estructura oficial para que quede guardado en Drive
+    var jsonBlob = Utilities.newBlob(JSON.stringify(structuredJson, null, 2), 'application/json', codigoDoc + '.json');
+    jsonBlob.externalUrlSource = links[0];
+    records.push(createRecord(jsonBlob, threadData, 'json', classif.label, structuredJson, links[0]));
+
+    // Si se rescató algún PDF en el proceso, asociarlo; si no, dejar constancia del enlace web externo
+    if (foundAsset) {
+      foundAsset.setName(codigoDoc + ".pdf");
+      // [CAMBIO v3 - Consulta 1] se pasa structuredJson (antes null) para heredar la fecha de emisión
+      records.push(createRecord(foundAsset, threadData, 'pdf', classif.label, structuredJson, links[0]));
+    } else {
+      // Guardar un registro del enlace web si el PDF no se descargó de forma binaria
+      Logger.log('   [✔] Registro DTE generado mediante enlace y datos de texto oficial.');
+      // [CAMBIO v3 - Consulta 4] El PDF no se pudo descargar: se deja registro de que falta
+      records.push(buildMissingCounterpartRecord(threadData, classif.label, 'PDF', codigoDoc + ".json", structuredJson, errorLogSheet, links[0]));
+    }
+
+    return { success: true, records: records, classification: classif };
+  }
+
+  return { success: false };
+}
+
+// [CAMBIO v3.2] Eliminadas funciones sin uso: extractAndUnzipAttachments() (la descompresión ZIP real se hace
+// inline en processDTEAttachments, paso "1. PROCESAMIENTO DE ADJUNTOS Y DESCOMPRESIÓN ZIP") y createErrorRecord().
+
+
+/**
+ * Guarda los registros de un hilo: omite duplicados, crea/reutiliza la estructura de carpetas en Drive
+ * (Año / Mes / Compras|Ventas), sube el archivo y agrega la fila en la hoja de la empresa.
+ * Devuelve { saved, duplicates }.
+ */
+function saveThreadData(configs, classif, records, threadData, monthNames, errorLogSheet) {
+  // [CAMBIO v3.3] Ahora devuelve { saved, duplicates } en lugar de nada
+  var result = { saved: 0, duplicates: 0 };
+  if (!records || records.length === 0) return result;
+
+  var scriptTimeZone = Session.getScriptTimeZone();
+  var localDate = new Date(Utilities.formatDate(threadData.date, scriptTimeZone, "yyyy-MM-dd HH:mm:ss"));
+  var year = localDate.getFullYear();
+  var monthName = monthNames[localDate.getMonth()];
+  var monthNum = (localDate.getMonth() + 1).toString().padStart(2, '0');
+
+  var folderCache = {};
+
+  records.forEach(function(r) {
+    // 1. Obtener la empresa correspondiente
+    var companyName = r.companyName || classif.name;
+    var config = configs.find(c => c.name === companyName) || configs[0];
+
+    if (!config) return;
+
+    // [CAMBIO v3.3] ===== CONTROL DE DUPLICADOS =====
+    // Se revisa ANTES de crear carpetas o subir a Drive. Clave = Código de Generación + formato.
+    // - Archivo real: se omite si ya existe un archivo real con esa clave.
+    // - Registro "No encontrado": se omite si ya existe el archivo real (ya llegó la pareja) o si ya
+    //   existe el mismo registro "No encontrado". Nunca bloquea la llegada posterior del archivo real.
+    var dedupKey = buildDedupKey(r);
+    var dedupIndex = dedupKey ? getDedupeIndex(config) : null;
+    var missingKey = dedupKey + '|FALTANTE';
+    if (dedupKey) {
+      var isDuplicate = r.isMissing ? (dedupIndex[dedupKey] || dedupIndex[missingKey]) : dedupIndex[dedupKey];
+      if (isDuplicate) {
+        result.duplicates++;
+        Logger.log('   [DUPLICADO] Omitido: ' + r.fileName + ' (clave ' + dedupKey + ')');
+        if (!r.isMissing && errorLogSheet) {
+          logToErrorSheet(errorLogSheet, 'DTE duplicado omitido', r.fileName, threadData, 'Ya existía en "' + config.sheetName + '". Clave: ' + dedupKey);
+        }
+        return;
+      }
+    }
+
+    var fullTypeLabel = r.type || classif.label || '';
+
+    // 2. Determinar si es Ventas o Compras
+    var folderType = 'DTE';
+    if (fullTypeLabel.indexOf('-Ventas') !== -1) {
+      folderType = 'Ventas - ' + config.name;
+    } else if (fullTypeLabel.indexOf('-Compras') !== -1) {
+      folderType = 'Compras - ' + config.name;
+    } else {
+      folderType = FOLDER_NO_PROCESADO;
+    }
+
+    // 3. Crear o reutilizar carpeta en Drive dentro del directorio de LA EMPRESA DETECTADA
+    var cacheKey = config.name + '_' + year + '_' + monthNum + '_' + folderType;
+    var targetFolder;
+
+    if (folderCache[cacheKey]) {
+      targetFolder = folderCache[cacheKey];
+    } else {
+      var yearDir = year + ' - ' + config.name;
+      var monthDir = monthNum + '-' + monthName + '-' + year + ' - ' + config.name;
+
+      var yearFolder = getOrCreateFolder(config.folder, yearDir);
+      var monthFolder = getOrCreateFolder(yearFolder, monthDir);
+
+      targetFolder = (folderType === FOLDER_NO_PROCESADO) 
+        ? monthFolder 
+        : getOrCreateFolder(monthFolder, folderType);
+
+      folderCache[cacheKey] = targetFolder;
+    }
+
+    // 4. Guardar el archivo en Drive y registrar en Sheet
+    var driveUrl = "NO GUARDADO";
+    if (r.attachment) {
+      try {
+        var file = targetFolder.createFile(r.attachment);
+        driveUrl = '=HYPERLINK("' + file.getUrl() + '", "Ver Archivo")';
+      } catch (e) {
+        driveUrl = "ERROR DRIVE";
+      }
+    } else if (r.externalUrl) {
+      driveUrl = r.externalUrl;
+    }
+
+    var row = [
+      fullTypeLabel, 
+      r.from || threadData.from, 
+      r.subject || threadData.subject, 
+      r.emailDate || localDate, 
+      monthName, 
+      year,
+      r.fileName, 
+      r.fileFormat, 
+      driveUrl, 
+      targetFolder.getName(), 
+      r.fechaEmision || '',
+      '=HYPERLINK("' + threadData.permalink + '", "Ver correo")', 
+      new Date(), 
+      r.externalUrl || '',
+      r.codigo || '' // [CAMBIO v3.3] columna 15: Código de Generación
+    ];
+
+    var written = writeDataToSheetImmediately(config.sheet, [row], config.sheetName);
+
+    // [CAMBIO v3.3] Se registra en el índice en memoria para detectar repetidos dentro de la misma ejecución.
+    // Si falló la subida a Drive no se indexa, así un reintento futuro sí podrá guardarlo.
+    if (written) {
+      result.saved++;
+      if (dedupKey && driveUrl !== "ERROR DRIVE") {
+        dedupIndex[r.isMissing ? missingKey : dedupKey] = true;
+      }
+    }
+  });
+
+  return result;
+}
+
+// ====================================================================================
+// === MÓDULO: ANTI-DUPLICADOS (v3.3) ===
+// ====================================================================================
+// Regla: dos archivos son el mismo si tienen el mismo Código de Generación y el mismo formato
+// (json / pdf / xml). El índice se arma una vez por ejecución leyendo la hoja de cada empresa
+// (columna 15, o el GUID del nombre de archivo en filas antiguas) y se actualiza al ir guardando.
+// Si un archivo no tiene un código confiable NO se deduplica (es preferible un duplicado que perder
+// un DTE legítimo por una coincidencia falsa).
+
+// Códigos "de relleno" que el script usa internamente y que NO identifican un DTE real.
+var GENERIC_CODES = ['dte_externo', 'dte_portal_externo', 'dte_complementario'];
+var GUID_REGEX = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+
+/**
+ * Devuelve el Código de Generación del JSON en mayúsculas, o '' si no existe o es un valor de relleno.
+ */
+function getCodigoGeneracion(json) {
+  if (!json) return '';
+  var c = (json.identificacion && json.identificacion.codigoGeneracion)
+    ? json.identificacion.codigoGeneracion
+    : (json.codigoGeneracion || '');
+  c = c.toString().trim().toUpperCase();
+  if (!c || GENERIC_CODES.indexOf(c.toLowerCase()) !== -1) return '';
+  return c;
+}
+
+/**
+ * Extrae un GUID (formato del Código de Generación) desde un nombre de archivo, en mayúsculas, o ''.
+ */
+function extractGuidFromName(name) {
+  var m = (name || '').toString().match(GUID_REGEX);
+  return m ? m[0].toUpperCase() : '';
+}
+
+/**
+ * Construye la clave de deduplicación "CODIGO|formato" de un registro, o '' si no tiene código confiable.
+ */
+function buildDedupKey(r) {
+  if (!r || !r.codigo) return '';
+  return r.codigo + '|' + (r.fileFormat || '').toString().toLowerCase();
+}
+
+/**
+ * Devuelve (y cachea en la config de la empresa) el índice de archivos ya registrados en su hoja.
+ * Claves reales: "CODIGO|formato". Claves de faltantes: "CODIGO|formato|FALTANTE".
+ */
+function getDedupeIndex(config) {
+  if (config.dedupeIndex) return config.dedupeIndex;
+
+  var index = {};
+  var sheet = config.sheet;
+  var lastRow = sheet.getLastRow();
+
+  if (lastRow > 1) {
+    var numCols = Math.min(SHEET_HEADERS.length, sheet.getMaxColumns());
+    var values = sheet.getRange(2, 1, lastRow - 1, numCols).getValues();
+
+    values.forEach(function(row) {
+      var fileName = (row[6] || '').toString();               // col G: nombre del archivo
+      var fmt = (row[7] || '').toString().toLowerCase();       // col H: formato
+      var driveUrl = (row[8] || '').toString();                // col I: URL en Drive
+      var codigoCol = (row[14] || '').toString().trim().toUpperCase(); // col O: código (filas nuevas)
+      var isMissing = /no encontrado/i.test(fileName);
+
+      if (driveUrl === 'ERROR DRIVE') return; // no llegó a guardarse: permitir reintento
+
+      // Filas antiguas (sin col O): solo se puede deducir el código del nombre si es un archivo real
+      var codigo = codigoCol || (isMissing ? '' : extractGuidFromName(fileName));
+      if (!codigo || !fmt) return;
+
+      index[codigo + '|' + fmt + (isMissing ? '|FALTANTE' : '')] = true;
+    });
+  }
+
+  config.dedupeIndex = index;
+  Logger.log('   [ÍNDICE] ' + config.sheetName + ': ' + Object.keys(index).length + ' claves cargadas para control de duplicados.');
+  return index;
+}
+
+// ====================================================================================
+// === UTILIDADES TÉCNICAS Y REPARACIÓN DE JSONS ===
+// ====================================================================================
+
+/**
+ * Devuelve la subcarpeta con ese nombre dentro de "parent"; si no existe la crea.
+ */
+function getOrCreateFolder(parent, name) {
+  var iter = parent.getFoldersByName(name);
+  return iter.hasNext() ? iter.next() : parent.createFolder(name);
+}
+
+/**
+ * Lee el NIT / número de documento de un objeto del JSON siguiendo una ruta (ej. "emisor" o "cliente.dte") o
+ * una lista de rutas posibles. Devuelve el valor sin guiones, o null.
+ */
+function getNit(obj, path) {
+  if (!obj) return null;
+
+  // Si le pasas un array de rutas posibles, intenta una por una
+  if (Array.isArray(path)) {
+    for (var i = 0; i < path.length; i++) {
+      var res = getNit(obj, path[i]);
+      if (res) return res;
+    }
+    return null;
+  }
+
+  // Descompone rutas anidadas tipo 'cliente.dte' o 'emisor.dte'
+  var keys = path.split('.');
+  var target = obj;
+
+  for (var k = 0; k < keys.length; k++) {
+    if (target && Object.prototype.hasOwnProperty.call(target, keys[k])) {
+      target = target[keys[k]];
+    } else {
+      target = null;
+      break;
+    }
+  }
+
+  if (!target) return null;
+
+  // Extrae la propiedad del NIT / Documento si target es un objeto, o el valor directo si es string
+  var rawVal = (typeof target === 'object') 
+    ? (target.nit || target.numDocumento || target.numeroDocumento || '') 
+    : target;
+
+  var val = (rawVal || '').toString().trim();
+  return val ? val.replace(/-/g, '') : null;
+}
+
+
+/**
+ * Devuelve la extensión (en minúsculas) de un nombre de archivo.
+ */
+function getExt(name) { return name.split('.').pop().toLowerCase(); }
+
+/**
+ * [CAMBIO v3 - Consulta 2] Devuelve solo el nombre del archivo, sin ruta de carpetas.
+ * Ej: "DTE_2026/abc.pdf" -> "abc.pdf"
+ * Los archivos extraídos de un ZIP conservan la ruta interna; los adjuntos directos no,
+ * y por eso solo "unos pocos" mostraban carpetas.
+ */
+function cleanFileName(name) {
+  return (name || '').toString().split(/[\\\/]/).pop();
+}
+
+/**
+ * [CAMBIO v3 - Consulta 4] ¿El nombre contiene un código de generación (GUID) típico de un DTE?
+ */
+function looksLikeDteName(name) {
+  return /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.test(name || '');
+}
+
+/**
+ * REPARACIÓN QUIRÚRGICA AVANZADA: Limpia caracteres de control, BOM y recorta JSONs malformados.
+ */
+function parseJSONSafe(content, name, errorLogSheet, threadData) {
+  if (!content) return null;
+  
+  // Limpiar BOM inicial y espacios vacíos
+  content = content.replace(/^\uFEFF/, '').trim();
+
+  // Limpieza de caracteres de control invisibles que rompen JSONs bancarios/comerciales
+  var cleanContent = content.replace(/\t/g, " ")
+                            .replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F]/g, "");
+
+  try {
+    return JSON.parse(cleanContent);
+  } catch (e) {
+    Logger.log('   [!] Fallo en JSON.parse() estándar para "' + name + '". Intentando reparación por sub-estructura...');
+    
+    // Intento de rescate cortando caracteres sobrantes al final del archivo
+    var lastBrace = cleanContent.lastIndexOf('}');
+    while (lastBrace !== -1) {
+      try {
+        var subContent = cleanContent.substring(0, lastBrace + 1);
+        var parsed = JSON.parse(subContent);
+        Logger.log('   [✔] JSON reparado exitosamente mediante recorte de cierre.');
+        return parsed;
+      } catch (err) {
+        lastBrace = cleanContent.lastIndexOf('}', lastBrace - 1);
+      }
+    }
+    
+    // Si todo falla, registrar en la hoja de errores
+    if (errorLogSheet && threadData) {
+      logToErrorSheet(errorLogSheet, "JSON Corrupto", name, threadData, e.toString());
+    }
+  }
+  return null;
+}
+
+/**
+ * Crea el registro (objeto) de un archivo real para escribir en la hoja: datos del correo, formato, tipo, fecha de
+ * emisión (si se pasa el JSON) y Código de Generación.
+ */
+function createRecord(blob, t, format, type, json, extUrl) {
+  return {
+    attachment: blob, from: t.from, subject: t.subject, fileName: blob.getName(), emailDate: t.date,
+    fileFormat: format, type: type, threadPermalink: t.permalink, externalUrl: extUrl || '',
+    fechaEmision: (json && json.identificacion) ? json.identificacion.fecEmi : '',
+    // [CAMBIO v3.3] Código de Generación: del JSON (también cuando se pasa el JSON pareja del PDF)
+    // o, si no hay JSON, del nombre del archivo (si contiene un GUID). Vacío = no se puede deduplicar.
+    codigo: getCodigoGeneracion(json) || extractGuidFromName(blob.getName())
+  };
+}
+
+
+/**
+ * Escribe filas al final de una hoja con hasta 3 reintentos (espera creciente). Devuelve true si lo logró.
+ */
+function writeDataToSheetImmediately(sheet, rows, name) {
+  var maxRetries = 3;
+  var retryDelay = 1000;
+
+  for (var attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      var last = sheet.getLastRow();
+      if (last + rows.length > sheet.getMaxRows()) sheet.insertRowsAfter(sheet.getMaxRows(), rows.length);
+      sheet.getRange(last + 1, 1, rows.length, rows[0].length).setValues(rows);
+      SpreadsheetApp.flush();
+      return true;
+    } catch (e) {
+      Logger.log('ERROR en intento ' + attempt + ' al escribir en ' + name + ': ' + e.toString());
+      if (attempt < maxRetries) {
+        Utilities.sleep(retryDelay);
+        retryDelay *= 2;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Obtiene o crea las etiquetas de Gmail: <Empresa>-Compras, <Empresa>-Ventas, "No procesado" y "Otros".
+ */
+function setupLabels() {
+  var labels = {};
+  COMPANIES.forEach(c => {
+    ['Compras', 'Ventas'].forEach(t => {
+      var n = c.name + '-' + t;
+      labels[n] = GmailApp.getUserLabelByName(n) || GmailApp.createLabel(n);
+    });
+  });
+  labels[FOLDER_NO_PROCESADO] = GmailApp.getUserLabelByName(FOLDER_NO_PROCESADO) || GmailApp.createLabel(FOLDER_NO_PROCESADO);
+  labels[LABEL_OTROS] = GmailApp.getUserLabelByName(LABEL_OTROS) || GmailApp.createLabel(LABEL_OTROS);
+  return labels;
+}
+
+/**
+ * Prepara, por cada empresa (más "No procesado"), su carpeta en Drive y su hoja "<Empresa> - Registros DTE"
+ * (la crea si no existe y agrega/actualiza los encabezados).
+ */
+function setupCompanyConfigs(root, headers) {
+  var list = COMPANIES.concat([{ name: FOLDER_NO_PROCESADO }]);
+  return list.map(c => {
+    var folder = getOrCreateFolder(root, c.name);
+    var sName = c.name + ' - Registros DTE';
+    var files = folder.getFilesByName(sName);
+    var ss;
+    if (files.hasNext()) {
+      ss = SpreadsheetApp.openById(files.next().getId());
+    } else {
+      ss = SpreadsheetApp.create(sName);
+      var file = DriveApp.getFileById(ss.getId());
+      folder.addFile(file);
+      DriveApp.getRootFolder().removeFile(file);
+    }
+    var sheet = ss.getSheets()[0];
+    if (sheet.getLastRow() === 0) {
+      sheet.appendRow(headers);
+    } else if (sheet.getRange(1, headers.length).getValue() === '') {
+      // [CAMBIO v3.3] Hojas creadas con versiones anteriores: se agrega el encabezado de la columna nueva
+      sheet.getRange(1, headers.length).setValue(headers[headers.length - 1]);
+    }
+    return { name: c.name, folder: folder, sheet: sheet, sheetName: sName };
+  });
+}
+
+/**
+ * Obtiene o crea la hoja "Log de Errores DTE" y devuelve su primera pestaña.
+ */
+function setupErrorLog(rootFolder) {
+  var files = rootFolder.getFilesByName(errorLogName);
+  var ss;
+  if (files.hasNext()) {
+    ss = SpreadsheetApp.openById(files.next().getId());
+  } else {
+    ss = SpreadsheetApp.create(errorLogName);
+    var file = DriveApp.getFileById(ss.getId());
+    rootFolder.addFile(file);
+    DriveApp.getRootFolder().removeFile(file);
+    ss.getSheets()[0].appendRow(['Fecha', 'Tipo Error', 'URL / Archivo', 'Remitente', 'Asunto', 'Link Correo', 'Detalle Técnico']);
+  }
+  return ss.getSheets()[0];
+}
+
+/**
+ * Agrega una fila al Log de Errores DTE (fecha, tipo, archivo/URL, remitente, asunto, enlace al correo y detalle).
+ */
+function logToErrorSheet(sheet, type, target, threadData, detail) {
+  sheet.appendRow([new Date(), type, target, threadData.from, threadData.subject, threadData.permalink, detail || ""]);
+}
+
+/**
+ * Toma el primer enlace del cuerpo del correo y trata de descargarlo (pdf/zip/html). Devuelve el blob, o
+ * { logError: true, url } si falla (registrando el error), o null si el correo no tiene enlaces.
+ */
+function attemptDownloadExternalFile(message, baseName, threadData, errorLogSheet) {
+  var body = message.getPlainBody();
+  var match = body.match(/(https?:\/\/[^\s\n]{5,})/i);
+  if (!match) return null;
+  var url = match[0].replace(/[>\]\)]+$/, '');
+  try {
+    var res = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true, timeoutSeconds: 30 });
+    var code = res.getResponseCode();
+    if (code === 200) {
+      var blob = res.getBlob();
+      var ct = (res.getHeaders()['Content-Type'] || '').toLowerCase();
+      var ext = ct.includes('pdf') ? 'pdf' : (ct.includes('zip') ? 'zip' : 'html');
+      blob.setName(baseName + "." + ext);
+      blob.externalUrlSource = url;
+      return blob;
+    } else {
+      logToErrorSheet(errorLogSheet, "HTTP " + code, url, threadData, "Fallo descarga PDF externo.");
+      return { logError: true, url: url };
+    }
+  } catch (e) {
+    logToErrorSheet(errorLogSheet, "Fetch Error", url, threadData, e.toString());
+    return { logError: true, url: url };
+  }
+}
+
+/**
+ * Envía un correo de alerta al administrador (recipientEmail). Se usa solo ante un fallo crítico general.
+ */
+function sendAdminNotification(title, detail) {
+  MailApp.sendEmail(recipientEmail, "⚠️ DTE Script CRÍTICO (ATS Group): " + title, detail);
+}
+
+// FUNCIONES DE MONITOREO Y SALUD 
+/**
+ * Utilidad manual: verifica que existan y sean escribibles las hojas de registro de las empresas indicadas.
+ */
+function quickHealthCheck() {
+  Logger.log('=== VERIFICACIÓN RÁPIDA DE SALUD ===');
+  var companies = ['ATS Group', 'No procesado'];
+  var allHealthy = true;
+  
+  companies.forEach(function(company) {
+    var sheetName = company + ' - Registros DTE';
+    var result = { name: company, healthy: false, message: '', lastRow: 0 };
+    
+    try {
+      var files = DriveApp.getFilesByName(sheetName);
+      if (files.hasNext()) {
+        var file = files.next();
+        var spreadsheet = SpreadsheetApp.openById(file.getId());
+        var sheet = spreadsheet.getSheets()[0];
+        var lastRow = sheet.getLastRow();
+        result.lastRow = lastRow;
+        
+        sheet.getRange(lastRow + 1, 1).setValue('TEST_HEALTH');
+        sheet.getRange(lastRow + 1, 1).clearContent();
+        result.healthy = true;
+        result.message = 'Saludable - ' + lastRow + ' filas';
+      } else {
+        result.message = 'Hoja no encontrada (se creará al procesar)';
+      }
+    } catch (healthError) {
+      allHealthy = false;
+      result.message = 'Error: ' + healthError.toString();
+    }
+    Logger.log(company + ': ' + result.message);
+  });
+  return allHealthy;
+}
+
+/**
+ * Utilidad manual: muestra en el log cuántos triggers tiene configurados el proyecto.
+ */
+function checkTriggerStatus() {
+  Logger.log('=== VERIFICACIÓN DE TRIGGERS ===');
+  var triggers = ScriptApp.getProjectTriggers();
+  if (triggers.length > 0) {
+    Logger.log('Triggers activos: ' + triggers.length);
+  } else {
+    Logger.log('❌ No hay triggers configurados en el proyecto');
+  }
+}
+/* Test para procesar diferentes estructuras dentro del json */
+
+function testIdentifyCompany() {
+  Logger.log('=== INICIO DE PRUEBAS DE ESTRUCTURA JSON ===');
+
+  // 1. Caso Estructura Antigua (emisor / receptor directo)
+  var jsonAntiguo = {
+    "emisor": { "nit": "03151306811028" },
+    "receptor": { "nit": "06143107971090" }
+  };
+
+  // 2. Caso Nueva Estructura (emisor.dte / cliente.dte)
+  var jsonNuevo = {
+    "emisor": {
+      "dte": { "nit": "03151306811028" }
+    },
+    "cliente": {
+      "dte": { "nit": "06143107971090" }
+    }
+  };
+
+  // 3. Caso Alternativo con numDocumento
+  var jsonConNumDocumento = {
+    "cliente": {
+      "dte": { "numDocumento": "0315-130681-102-8" }
+    }
+  };
+
+  // Ejecución de pruebas
+  var res1 = identifyCompany(jsonAntiguo);
+  Logger.log('Prueba 1 (Antiguo): ' + JSON.stringify(res1));
+
+  var res2 = identifyCompany(jsonNuevo);
+  Logger.log('Prueba 2 (Nuevo dte): ' + JSON.stringify(res2));
+
+  var res3 = getNit(jsonConNumDocumento, ['cliente.dte', 'receptor']);
+  Logger.log('Prueba 3 (getNit con guiones): ' + res3);
+
+  // Verificación visual de los resultados
+  if (res1.name !== FOLDER_NO_PROCESADO && res2.name !== FOLDER_NO_PROCESADO) {
+    Logger.log('TODAS LAS PRUEBAS PASARON CORRECTAMENTE.');
+  } else {
+    Logger.log('OCURRIÓ UN ERROR EN LA IDENTIFICACIÓN.');
+  }
+}
+
+/* Test para validar el funcionamiento de DTE pertenecientes a diferentes empresas */
+
+function testMultiCompanyProcessing() {
+  Logger.log('=== INICIO PRUEBA MULTI-DTE Y MULTI-EMPRESA EN UN MISMO CORREO ===');
+
+  // 1. Simulación de mensajes y blobs que vendrían en un mismo correo
+  var threadData = {
+    subject: "Facturas de prueba consolidadas",
+    from: "facturacion@proveedor.com",
+    date: new Date(),
+    permalink: "https://mail.google.com/test",
+    id: "msg_test_123"
+  };
+
+  // Simulación de JSON 1: Pertenece a ATS Group (03151306811028)
+  var jsonBlob1 = Utilities.newBlob(JSON.stringify({
+    emisor: { dte: { nit: "03151306811028" } },
+    cliente: { dte: { nit: "99999999999999" } }
+  }), 'application/json', 'Factura_ATS.json');
+
+  // Simulación de JSON 2: Pertenece a Walmart (06143107971090)
+  var jsonBlob2 = Utilities.newBlob(JSON.stringify({
+    emisor: { dte: { nit: "88888888888888" } },
+    cliente: { dte: { nit: "06143107971090" } }
+  }), 'application/json', 'Factura_Walmart.json');
+
+  var jsonAttachments = [jsonBlob1, jsonBlob2];
+  var processedAttachments = [jsonBlob1, jsonBlob2]; // Podrían incluirse PDFs simularizados aquí
+
+  // 2. Estructura de agrupación igual a la implementada en processDTEAttachments
+  var companyGroups = {};
+
+  for (var j = 0; j < jsonAttachments.length; j++) {
+    var currentJsonBlob = jsonAttachments[j];
+    var jsonContentString = currentJsonBlob.getDataAsString('UTF-8');
+    var jsonData = JSON.parse(jsonContentString);
+
+    if (jsonData) {
+      // Identificación individual por DTE
+      var dteClassification = identifyCompany(jsonData);
+      var companyKey = dteClassification.name;
+
+      Logger.log('Archivo "' + currentJsonBlob.getName() + '" clasificado como -> ' + companyKey + ' (' + dteClassification.type + ')');
+
+      if (!companyGroups[companyKey]) {
+        companyGroups[companyKey] = {
+          classification: dteClassification,
+          records: []
+        };
+      }
+
+      // Simular creación del registro
+      companyGroups[companyKey].records.push({
+        fileName: currentJsonBlob.getName(),
+        companyLabel: dteClassification.label
+      });
+    }
+  }
+
+  // 3. Verificación de Resultados
+  Logger.log('=== RESULTADOS DE LA AGRUPACIÓN ===');
+  var detectedKeys = Object.keys(companyGroups);
+  Logger.log('Empresas identificadas en el correo: ' + detectedKeys.join(', '));
+
+  detectedKeys.forEach(function(key) {
+    var group = companyGroups[key];
+    Logger.log('-> Empresa: ' + key + ' | Etiqueta Gmail: ' + group.classification.label + ' | Cantidad de archivos: ' + group.records.length);
+  });
+
+  if (detectedKeys.length > 1) {
+    Logger.log('PRUEBA EXITOSA: El correo se dividió correctamente entre ' + detectedKeys.length + ' empresas diferentes.');
+  } else {
+    Logger.log('PRUEBA FALLIDA: No se lograron separar las empresas.');
+  }
+}
