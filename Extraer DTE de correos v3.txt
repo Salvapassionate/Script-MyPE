@@ -49,6 +49,10 @@
 // ====================================================================================
 // === CONFIGURACIÓN GLOBAL ===
 // ====================================================================================
+// ====================================================================================
+// === CONFIGURACIÓN GLOBAL DEL CLIENTE (ÚNICO BLOQUE A MODIFICAR POR CLIENTE) ===
+// ====================================================================================
+
 var CONFIG = {
   // 1. Datos de Identificación del Cliente
   CLIENT_NAME: 'ATS Group', 
@@ -108,7 +112,6 @@ function processDTEAttachments() {
     return (new Date().getTime() - startTime) > (CONFIG.MAX_EXECUTION_TIME_MS - CONFIG.SAFETY_MARGIN_MS);
   }
 
-  var sheetHeaders = CONFIG.SHEET_HEADERS;
   var lock = LockService.getScriptLock();
   
   if (!lock.tryLock(10000)) {
@@ -118,16 +121,14 @@ function processDTEAttachments() {
 
   try {
     Logger.log('>>> [INICIO] Ejecutando motor optimizado DTE');
-    
-    var dteMainFolder;
-    try {
-      dteMainFolder = DriveApp.getFolderById(CONFIG.DTE_ROOT_FOLDER_ID);
-    } catch (e) {
-      Logger.log('ERROR CRÍTICO: Carpeta raíz inaccesible - ID: ' + CONFIG.DTE_ROOT_FOLDER_ID);
-      throw e;
-    }
 
+    // 1. VERIFICACIÓN Y CREACIÓN DE TODAS LAS ETIQUETAS AL INICIAR
     var allLabels = setupLabels();
+
+    // 2. VERIFICACIÓN / AUTOCURACIÓN DE LA CARPETA RAÍZ EN DRIVE
+    var dteMainFolder = getOrCreateRootFolder();
+
+    // 3. PREPARACIÓN DE CONFIGURACIONES Y LOG DE ERRORES
     var configs = setupCompanyConfigs(dteMainFolder, CONFIG.SHEET_HEADERS);
     var errorLogSheet = setupErrorLog(dteMainFolder);
 
@@ -148,7 +149,7 @@ function processDTEAttachments() {
       var firstMsgSubject = threadMessages[0].getSubject().toLowerCase();
       var firstMsgFrom = threadMessages[0].getFrom().toLowerCase();
 
-      // FILTRO DE SEGURIDAD: Ignorar correos del sistema, alertas de seguridad o notificaciones del propio script
+      // Filtro de seguridad: ignorar correos de alertas o notificaciones de error propias
       if (firstMsgSubject.includes('dte script crítico') || firstMsgSubject.includes('security alert') || firstMsgFrom.includes('no-reply@accounts.google.com')) {
         Logger.log('>>> [SKIP] Correo de sistema o alerta ignorado: "' + threadMessages[0].getSubject() + '"');
         thread.addLabel(allLabels[CONFIG.LABEL_OTROS]);
@@ -300,6 +301,62 @@ function processDTEAttachments() {
 }
 
 // ====================================================================================
+// === FUNCIONES DE VALIDACIÓN INICIAL Y AUTOCURACIÓN ===
+// ====================================================================================
+
+/**
+  * Verifica y crea de forma anticipada TODAS las etiquetas en Gmail (incluso si no hay correos).
+  */
+function setupLabels() {
+  var labels = {};
+  COMPANIES.forEach(c => {
+    var labelCompras = c.name + (CONFIG.LABEL_COMPRAS_SUFFIX || '-Compras');
+    var labelVentas = c.name + (CONFIG.LABEL_VENTAS_SUFFIX || '-Ventas');
+
+    labels[labelCompras] = GmailApp.getUserLabelByName(labelCompras) || GmailApp.createLabel(labelCompras);
+    labels[labelVentas] = GmailApp.getUserLabelByName(labelVentas) || GmailApp.createLabel(labelVentas);
+  });
+
+  labels[CONFIG.FOLDER_NO_PROCESADO] = GmailApp.getUserLabelByName(CONFIG.FOLDER_NO_PROCESADO) || GmailApp.createLabel(CONFIG.FOLDER_NO_PROCESADO);
+  labels[CONFIG.LABEL_OTROS] = GmailApp.getUserLabelByName(CONFIG.LABEL_OTROS) || GmailApp.createLabel(CONFIG.LABEL_OTROS);
+
+  Logger.log('>>> [ETIQUETAS] Verificación completa de etiquetas en Gmail.');
+  return labels;
+}
+
+/**
+  * Obtiene la carpeta raíz de Google Drive por su ID. Si no existe o el usuario la borró,
+  * busca si hay una carpeta con ese nombre o la crea automáticamente.
+  */
+function getOrCreateRootFolder() {
+  var rootFolder;
+  if (CONFIG.DTE_ROOT_FOLDER_ID && CONFIG.DTE_ROOT_FOLDER_ID.trim() !== '') {
+    try {
+      rootFolder = DriveApp.getFolderById(CONFIG.DTE_ROOT_FOLDER_ID);
+      if (rootFolder.isTrashed()) {
+        throw new Error("La carpeta configurada está en la papelera.");
+      }
+      return rootFolder;
+    } catch (e) {
+      Logger.log('⚠️ ADVERTENCIA: ID de carpeta inaccesible o eliminado (' + CONFIG.DTE_ROOT_FOLDER_ID + '). Creando o buscando por nombre...');
+    }
+  }
+
+  var existingFolders = DriveApp.getFoldersByName(CONFIG.DTE_ROOT_FOLDER_NAME);
+  while (existingFolders.hasNext()) {
+    var folder = existingFolders.next();
+    if (!folder.isTrashed()) {
+      Logger.log('✔ Carpeta encontrada por nombre: ' + folder.getName() + ' (ID: ' + folder.getId() + ')');
+      return folder;
+    }
+  }
+
+  rootFolder = DriveApp.createFolder(CONFIG.DTE_ROOT_FOLDER_NAME);
+  Logger.log('✔ Carpeta raíz creada automáticamente: ' + CONFIG.DTE_ROOT_FOLDER_NAME + ' (ID: ' + rootFolder.getId() + ')');
+  return rootFolder;
+}
+
+// ====================================================================================
 // === FUNCIONES AUXILIARES Y DE SOPORTE ===
 // ====================================================================================
 
@@ -353,8 +410,8 @@ function identifyCompany(jsonData) {
     var c = COMPANIES[i];
     var nitList = Array.isArray(c.nit) ? c.nit : [c.nit];
     
-    if (nitList.indexOf(emisor) !== -1) return { name: c.name, type: 'Ventas', label: c.name + CONFIG.LABEL_VENTAS_SUFFIX };
-    if (nitList.indexOf(receptor) !== -1) return { name: c.name, type: 'Compras', label: c.name + CONFIG.LABEL_COMPRAS_SUFFIX };
+    if (nitList.indexOf(emisor) !== -1) return { name: c.name, type: 'Ventas', label: c.name + (CONFIG.LABEL_VENTAS_SUFFIX || '-Ventas') };
+    if (nitList.indexOf(receptor) !== -1) return { name: c.name, type: 'Compras', label: c.name + (CONFIG.LABEL_COMPRAS_SUFFIX || '-Compras') };
   }
   return { name: CONFIG.FOLDER_NO_PROCESADO, type: 'DTE', label: CONFIG.FOLDER_NO_PROCESADO };
 }
@@ -483,9 +540,12 @@ function saveThreadData(configs, classif, records, threadData, monthNames, error
 
     var fullTypeLabel = r.type || classif.label || '';
     var folderType = 'DTE';
-    if (fullTypeLabel.indexOf(CONFIG.LABEL_VENTAS_SUFFIX) !== -1) {
+    var comprasSuffix = CONFIG.LABEL_COMPRAS_SUFFIX || '-Compras';
+    var ventasSuffix = CONFIG.LABEL_VENTAS_SUFFIX || '-Ventas';
+
+    if (fullTypeLabel.indexOf(ventasSuffix) !== -1) {
       folderType = 'Ventas - ' + config.name;
-    } else if (fullTypeLabel.indexOf(CONFIG.LABEL_COMPRAS_SUFFIX) !== -1) {
+    } else if (fullTypeLabel.indexOf(comprasSuffix) !== -1) {
       folderType = 'Compras - ' + config.name;
     } else {
       folderType = CONFIG.FOLDER_NO_PROCESADO;
@@ -686,19 +746,6 @@ function writeDataToSheetImmediately(sheet, rows, name) {
   return false;
 }
 
-function setupLabels() {
-  var labels = {};
-  COMPANIES.forEach(c => {
-    ['Compras', 'Ventas'].forEach(t => {
-      var n = c.name + '-' + t;
-      labels[n] = GmailApp.getUserLabelByName(n) || GmailApp.createLabel(n);
-    });
-  });
-  labels[CONFIG.FOLDER_NO_PROCESADO] = GmailApp.getUserLabelByName(CONFIG.FOLDER_NO_PROCESADO) || GmailApp.createLabel(CONFIG.FOLDER_NO_PROCESADO);
-  labels[CONFIG.LABEL_OTROS] = GmailApp.getUserLabelByName(CONFIG.LABEL_OTROS) || GmailApp.createLabel(CONFIG.LABEL_OTROS);
-  return labels;
-}
-
 function setupCompanyConfigs(root, headers) {
   var list = COMPANIES.concat([{ name: CONFIG.FOLDER_NO_PROCESADO }]);
   return list.map(c => {
@@ -771,7 +818,6 @@ function attemptDownloadExternalFile(message, baseName, threadData, errorLogShee
 function sendAdminNotification(title, detail) {
   MailApp.sendEmail(CONFIG.RECIPIENT_EMAIL, "⚠️ DTE Script CRÍTICO (ATS Group): " + title, detail);
 }
-
 // FUNCIONES DE MONITOREO Y SALUD 
 /**
  * Utilidad manual: verifica que existan y sean escribibles las hojas de registro de las empresas indicadas.
