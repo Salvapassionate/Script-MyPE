@@ -49,26 +49,21 @@
 // ====================================================================================
 // === CONFIGURACIÓN GLOBAL ===
 // ====================================================================================
-
-// ====================================================================================
-// === CONFIGURACIÓN GLOBAL DEL CLIENTE (ÚNICO BLOQUE A MODIFICAR POR CLIENTE) ===
-// ====================================================================================
-
 var CONFIG = {
   // 1. Datos de Identificación del Cliente
-  CLIENT_NAME: 'Marlene DTE', 
-  CLIENT_NITS: ["02073991-2", "020739912"], 
+  CLIENT_NAME: 'ATS Group', 
+  CLIENT_NITS: ["03151306811028"], 
 
   // 2. Comunicaciones y Notificaciones
   RECIPIENT_EMAIL: 'facturacion.atsgroup@gmail.com', 
 
   // 3. IDs y Nombres de Google Drive
-  DTE_ROOT_FOLDER_ID: '16daw-uuJrzoL0Zn5RQzgE6htjt_NdKtu', 
+  DTE_ROOT_FOLDER_ID: '1HEE3Y_rrb2mTKuCEITrtHB1-J5W_kxNs', 
   DTE_ROOT_FOLDER_NAME: 'Registros DTE',
   ERROR_LOG_NAME: 'Log de Errores DTE',
 
   // 4. Nombres de Carpetas y Etiquetas en Gmail
-  FOLDER_NO_PROCESADO: 'No procesado',
+  FOLDER_NO_PROCESADO: 'No procesado -TEST',
   LABEL_OTROS: 'Otros',
   LABEL_COMPRAS_SUFFIX: '-Compras',
   LABEL_VENTAS_SUFFIX: '-Ventas',
@@ -94,12 +89,10 @@ var CONFIG = {
   ]
 };
 
-// Se deriva automáticamente la matriz COMPANIES a partir de la configuración central
 var COMPANIES = [
   { name: CONFIG.CLIENT_NAME, nit: CONFIG.CLIENT_NITS }
 ];
 
-// Opciones globales auxiliares basadas en CONFIG para evitar ReferenceError
 var ORPHAN_REQUIRE_DTE_NAME = true;
 var GENERIC_CODES = ['dte_externo', 'dte_portal_externo', 'dte_complementario'];
 var GUID_REGEX = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
@@ -124,7 +117,7 @@ function processDTEAttachments() {
   }
 
   try {
-    Logger.log('>>> [INICIO] Ejecutando motor optimizado DTE (Soporte Walmart, JSONs y Zips)');
+    Logger.log('>>> [INICIO] Ejecutando motor optimizado DTE');
     
     var dteMainFolder;
     try {
@@ -152,6 +145,17 @@ function processDTEAttachments() {
 
       var thread = threads[i];
       var threadMessages = thread.getMessages();
+      var firstMsgSubject = threadMessages[0].getSubject().toLowerCase();
+      var firstMsgFrom = threadMessages[0].getFrom().toLowerCase();
+
+      // FILTRO DE SEGURIDAD: Ignorar correos del sistema, alertas de seguridad o notificaciones del propio script
+      if (firstMsgSubject.includes('dte script crítico') || firstMsgSubject.includes('security alert') || firstMsgFrom.includes('no-reply@accounts.google.com')) {
+        Logger.log('>>> [SKIP] Correo de sistema o alerta ignorado: "' + threadMessages[0].getSubject() + '"');
+        thread.addLabel(allLabels[CONFIG.LABEL_OTROS]);
+        stats.others++;
+        continue;
+      }
+
       var threadPermalink = thread.getPermalink();
       var classification = null;
       var records = [];
@@ -184,7 +188,6 @@ function processDTEAttachments() {
                 if (extractedName.endsWith('.json') || extractedName.endsWith('.pdf') || extractedName.endsWith('.xml')) {
                   extractedFiles[e].setName(cleanFileName(extractedFiles[e].getName()));
                   processedAttachments.push(extractedFiles[e]);
-                  Logger.log('    -> Archivo extraído exitosamente: ' + extractedFiles[e].getName());
                 }
               }
             } catch (zipErr) {
@@ -206,7 +209,7 @@ function processDTEAttachments() {
         var usedAssets = [];
 
         if (nativeJsons.length > 0) {
-          Logger.log('   [A] ' + nativeJsons.length + ' JSON(s) detectado(s). Procesando lote completo...');
+          Logger.log('   [A] ' + nativeJsons.length + ' JSON(s) detectado(s). Procesando lote...');
           
           nativeJsons.forEach(function(currentJson) {
             var jsonContentString = currentJson.getDataAsString('UTF-8');
@@ -250,7 +253,7 @@ function processDTEAttachments() {
           records = records.concat(orphanA.records);
           classification = orphanA.classification;
         } else {
-          Logger.log('   [B] No hay JSON adjunto directo. Iniciando análisis de enlaces externos (Modo Sonda)...');
+          Logger.log('   [B] No hay JSON adjunto directo. Analizando enlaces externos...');
           var scan = scanExternalLinks(currentMessage, threadData, errorLogSheet);
           if (scan.success) {
             records = records.concat(scan.records);
@@ -277,7 +280,7 @@ function processDTEAttachments() {
         stats.processed++;
         stats.files += saveResult.saved;
         stats.duplicates += saveResult.duplicates;
-        Logger.log('>>> [OK] Hilo procesado. Guardados: ' + saveResult.saved + ' | Duplicados omitidos: ' + saveResult.duplicates);
+        Logger.log('>>> [OK] Hilo procesado. Guardados: ' + saveResult.saved + ' | Duplicados: ' + saveResult.duplicates);
       } else {
         thread.addLabel(allLabels[CONFIG.LABEL_OTROS]);
         stats.others++;
@@ -286,7 +289,7 @@ function processDTEAttachments() {
     }
 
     SpreadsheetApp.flush();
-    Logger.log('>>> [FIN] Procesamiento finalizado. Procesados: ' + stats.processed + ' | Archivos guardados: ' + stats.files + ' | Duplicados omitidos: ' + stats.duplicates + ' | Otros: ' + stats.others);
+    Logger.log('>>> [FIN] Procesamiento finalizado. Procesados: ' + stats.processed + ' | Archivos guardados: ' + stats.files);
 
   } catch (e) {
     Logger.log('>>> [ERROR CRÍTICO GENERAL] ' + e.toString());
@@ -297,19 +300,15 @@ function processDTEAttachments() {
 }
 
 // ====================================================================================
-// === FUNCIONES DE APOYO Y AUXILIARES ===
+// === FUNCIONES AUXILIARES Y DE SOPORTE ===
 // ====================================================================================
 
 function buildMissingCounterpartRecord(t, type, missingFormat, receivedFileName, json, errorLogSheet, extUrl) {
   var fmt = missingFormat.toUpperCase();
   var received = cleanFileName(receivedFileName);
-  Logger.log('   [!] Falta ' + fmt + ' contraparte de: ' + received);
-
   if (errorLogSheet) {
-    logToErrorSheet(errorLogSheet, 'Falta contraparte ' + fmt, received, t,
-      'Se recibió "' + received + '" pero no se encontró su ' + fmt + ' correspondiente.');
+    logToErrorSheet(errorLogSheet, 'Falta contraparte ' + fmt, received, t, 'Se recibió "' + received + '" pero no su ' + fmt);
   }
-
   return {
     attachment: null,
     from: t.from,
@@ -332,12 +331,8 @@ function registerOrphanAssets(assets, usedAssets, threadData, classification, er
 
   assets.forEach(function(asset) {
     if (usedAssets.indexOf(asset) !== -1) return;
-
     var cleanName = cleanFileName(asset.getName());
-    if (ORPHAN_REQUIRE_DTE_NAME && !looksLikeDteName(cleanName)) {
-      Logger.log('   [i] Archivo "' + cleanName + '" ignorado (no parece un DTE y no tiene JSON contraparte).');
-      return;
-    }
+    if (ORPHAN_REQUIRE_DTE_NAME && !looksLikeDteName(cleanName)) return;
 
     if (!finalClassif) {
       finalClassif = { name: CONFIG.FOLDER_NO_PROCESADO, type: 'DTE', label: CONFIG.FOLDER_NO_PROCESADO };
@@ -454,48 +449,6 @@ function scanExternalLinks(message, threadData, errorLogSheet) {
     return { success: true, records: records, classification: classif };
   }
 
-  if (links.length > 0) {
-    var docMatch = plainBody.match(/(?:NUMERO DOCUMENTO|DTE):\s*([A-Za-z0-9\-]+)/i);
-    var fechaMatch = plainBody.match(/FECHA:\s*([0-9\/\-\:\s]+)/i);
-    var codigoDoc = docMatch ? docMatch[1].trim() : 'DTE_Portal_Externo';
-    
-    var nitEmisorMatch = plainBody.match(/NIT\s*([0-9\-]+)/i);
-    var nitEmisorLimpio = nitEmisorMatch ? nitEmisorMatch[1].replace(/-/g, '') : '06143107971090';
-
-    var fechaEmiOficial = new Date().toISOString();
-    if (fechaMatch) {
-      var partesFecha = fechaMatch[1].trim().split(/[\/\-\s:]+/);
-      if (partesFecha.length >= 3) {
-        fechaEmiOficial = partesFecha[2] + '-' + partesFecha[1] + '-' + partesFecha[0] + 'T00:00:00';
-      }
-    }
-
-    var structuredJson = {
-      emisor: { nit: nitEmisorLimpio },
-      receptor: { numDocumento: 'eventomania' },
-      identificacion: { 
-        codigoGeneracion: codigoDoc, 
-        fecEmi: fechaEmiOficial 
-      }
-    };
-
-    var classif = identifyCompany(structuredJson);
-    var records = [];
-
-    var jsonBlob = Utilities.newBlob(JSON.stringify(structuredJson, null, 2), 'application/json', codigoDoc + '.json');
-    jsonBlob.externalUrlSource = links[0];
-    records.push(createRecord(jsonBlob, threadData, 'json', classif.label, structuredJson, links[0]));
-
-    if (foundAsset) {
-      foundAsset.setName(codigoDoc + ".pdf");
-      records.push(createRecord(foundAsset, threadData, 'pdf', classif.label, structuredJson, links[0]));
-    } else {
-      records.push(buildMissingCounterpartRecord(threadData, classif.label, 'PDF', codigoDoc + ".json", structuredJson, errorLogSheet, links[0]));
-    }
-
-    return { success: true, records: records, classification: classif };
-  }
-
   return { success: false };
 }
 
@@ -524,9 +477,6 @@ function saveThreadData(configs, classif, records, threadData, monthNames, error
       var isDuplicate = r.isMissing ? (dedupIndex[dedupKey] || dedupIndex[missingKey]) : dedupIndex[dedupKey];
       if (isDuplicate) {
         result.duplicates++;
-        if (!r.isMissing && errorLogSheet) {
-          logToErrorSheet(errorLogSheet, 'DTE duplicado omitido', r.fileName, threadData, 'Ya existía en "' + config.sheetName + '". Clave: ' + dedupKey);
-        }
         return;
       }
     }
@@ -661,7 +611,6 @@ function getOrCreateFolder(parent, name) {
 
 function getNit(obj, path) {
   if (!obj) return null;
-
   if (Array.isArray(path)) {
     for (var i = 0; i < path.length; i++) {
       var res = getNit(obj, path[i]);
@@ -669,10 +618,8 @@ function getNit(obj, path) {
     }
     return null;
   }
-
   var keys = path.split('.');
   var target = obj;
-
   for (var k = 0; k < keys.length; k++) {
     if (target && Object.prototype.hasOwnProperty.call(target, keys[k])) {
       target = target[keys[k]];
@@ -681,50 +628,30 @@ function getNit(obj, path) {
       break;
     }
   }
-
   if (!target) return null;
-
-  var rawVal = (typeof target === 'object') 
-    ? (target.nit || target.numDocumento || target.numeroDocumento || '') 
-    : target;
-
+  var rawVal = (typeof target === 'object') ? (target.nit || target.numDocumento || target.numeroDocumento || '') : target;
   var val = (rawVal || '').toString().trim();
   return val ? val.replace(/-/g, '') : null;
 }
 
 function getExt(name) { return name.split('.').pop().toLowerCase(); }
-
-function cleanFileName(name) {
-  return (name || '').toString().split(/[\\\/]/).pop();
-}
-
-function looksLikeDteName(name) {
-  return GUID_REGEX.test(name || '');
-}
+function cleanFileName(name) { return (name || '').toString().split(/[\\\/]/).pop(); }
+function looksLikeDteName(name) { return GUID_REGEX.test(name || ''); }
 
 function parseJSONSafe(content, name, errorLogSheet, threadData) {
   if (!content) return null;
-  
   content = content.replace(/^\uFEFF/, '').trim();
-  var cleanContent = content.replace(/\t/g, " ")
-                        .replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F]/g, "");
-
+  var cleanContent = content.replace(/\t/g, " ").replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F]/g, "");
   try {
     return JSON.parse(cleanContent);
   } catch (e) {
     var lastBrace = cleanContent.lastIndexOf('}');
     while (lastBrace !== -1) {
       try {
-        var subContent = cleanContent.substring(0, lastBrace + 1);
-        var parsed = JSON.parse(subContent);
-        return parsed;
+        return JSON.parse(cleanContent.substring(0, lastBrace + 1));
       } catch (err) {
         lastBrace = cleanContent.lastIndexOf('}', lastBrace - 1);
       }
-    }
-    
-    if (errorLogSheet && threadData) {
-      logToErrorSheet(errorLogSheet, "JSON Corrupto", name, threadData, e.toString());
     }
   }
   return null;
@@ -742,7 +669,6 @@ function createRecord(blob, t, format, type, json, extUrl) {
 function writeDataToSheetImmediately(sheet, rows, name) {
   var maxRetries = 3;
   var retryDelay = 1000;
-
   for (var attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       var last = sheet.getLastRow();
