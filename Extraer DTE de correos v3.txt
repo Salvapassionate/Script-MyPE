@@ -49,9 +49,7 @@
 // ====================================================================================
 // === CONFIGURACIÓN GLOBAL ===
 // ====================================================================================
-// ====================================================================================
-// === CONFIGURACIÓN GLOBAL DEL CLIENTE (ÚNICO BLOQUE A MODIFICAR POR CLIENTE) ===
-// ====================================================================================
+
 
 var CONFIG = {
   // 1. Datos de Identificación del Cliente
@@ -71,6 +69,8 @@ var CONFIG = {
   LABEL_OTROS: 'Otros',
   LABEL_COMPRAS_SUFFIX: '-Compras',
   LABEL_VENTAS_SUFFIX: '-Ventas',
+  PROCESSED_LABEL_NAME: 'DTE-Procesado', 
+  GMAIL_SEARCH_QUERY: 'in:inbox -label:DTE-Procesado', 
 
   // 5. Textos de Mensajes y Etiquetas Especiales
   LABEL_PDF_MISSING: 'PDF - No encontrado',
@@ -122,17 +122,13 @@ function processDTEAttachments() {
   try {
     Logger.log('>>> [INICIO] Ejecutando motor optimizado DTE');
 
-    // 1. VERIFICACIÓN Y CREACIÓN DE TODAS LAS ETIQUETAS AL INICIAR
     var allLabels = setupLabels();
-
-    // 2. VERIFICACIÓN / AUTOCURACIÓN DE LA CARPETA RAÍZ EN DRIVE
     var dteMainFolder = getOrCreateRootFolder();
-
-    // 3. PREPARACIÓN DE CONFIGURACIONES Y LOG DE ERRORES
     var configs = setupCompanyConfigs(dteMainFolder, CONFIG.SHEET_HEADERS);
     var errorLogSheet = setupErrorLog(dteMainFolder);
 
-    var threads = GmailApp.search("in:inbox has:nouserlabels");
+    
+    var threads = GmailApp.search(CONFIG.GMAIL_SEARCH_QUERY);
     Logger.log('>>> [BANDEJA] ' + threads.length + ' hilos de correo por procesar.');
 
     var stats = { processed: 0, files: 0, duplicates: 0, others: 0, executionStopped: false };
@@ -149,10 +145,10 @@ function processDTEAttachments() {
       var firstMsgSubject = threadMessages[0].getSubject().toLowerCase();
       var firstMsgFrom = threadMessages[0].getFrom().toLowerCase();
 
-      // Filtro de seguridad: ignorar correos de alertas o notificaciones de error propias
+      // Ignorar correos de alerta/sistema
       if (firstMsgSubject.includes('dte script crítico') || firstMsgSubject.includes('security alert') || firstMsgFrom.includes('no-reply@accounts.google.com')) {
-        Logger.log('>>> [SKIP] Correo de sistema o alerta ignorado: "' + threadMessages[0].getSubject() + '"');
         thread.addLabel(allLabels[CONFIG.LABEL_OTROS]);
+        if (allLabels[CONFIG.PROCESSED_LABEL_NAME]) thread.addLabel(allLabels[CONFIG.PROCESSED_LABEL_NAME]);
         stats.others++;
         continue;
       }
@@ -166,7 +162,7 @@ function processDTEAttachments() {
         var threadData = {
           subject: currentMessage.getSubject(),
           from: currentMessage.getFrom(),
-          date: currentMessage.getDate(),
+          date: currentMessage.getDate(), 
           permalink: threadPermalink,
           id: currentMessage.getId()
         };
@@ -181,7 +177,6 @@ function processDTEAttachments() {
           var name = att.getName().toLowerCase();
           
           if (name.endsWith('.zip')) {
-            Logger.log('📦 Archivo ZIP detectado: ' + att.getName() + ' -> Extrayendo contenido en memoria...');
             try {
               var extractedFiles = Utilities.unzip(att);
               for (var e = 0; e < extractedFiles.length; e++) {
@@ -192,7 +187,6 @@ function processDTEAttachments() {
                 }
               }
             } catch (zipErr) {
-              Logger.log('❌ Error descomprimiendo ZIP: ' + zipErr.toString());
               logToErrorSheet(errorLogSheet, "Error ZIP", att.getName(), threadData, zipErr.toString());
               processedAttachments.push(att); 
             }
@@ -210,8 +204,6 @@ function processDTEAttachments() {
         var usedAssets = [];
 
         if (nativeJsons.length > 0) {
-          Logger.log('   [A] ' + nativeJsons.length + ' JSON(s) detectado(s). Procesando lote...');
-          
           nativeJsons.forEach(function(currentJson) {
             var jsonContentString = currentJson.getDataAsString('UTF-8');
             var jsonData = parseJSONSafe(jsonContentString, currentJson.getName(), errorLogSheet, threadData);
@@ -254,7 +246,6 @@ function processDTEAttachments() {
           records = records.concat(orphanA.records);
           classification = orphanA.classification;
         } else {
-          Logger.log('   [B] No hay JSON adjunto directo. Analizando enlaces externos...');
           var scan = scanExternalLinks(currentMessage, threadData, errorLogSheet);
           if (scan.success) {
             records = records.concat(scan.records);
@@ -281,11 +272,14 @@ function processDTEAttachments() {
         stats.processed++;
         stats.files += saveResult.saved;
         stats.duplicates += saveResult.duplicates;
-        Logger.log('>>> [OK] Hilo procesado. Guardados: ' + saveResult.saved + ' | Duplicados: ' + saveResult.duplicates);
       } else {
         thread.addLabel(allLabels[CONFIG.LABEL_OTROS]);
         stats.others++;
-        Logger.log('>>> [SKIP] Hilo sin documentos DTE válidos identificados.');
+      }
+
+      // Se le marca la etiqueta de procesado para no volverlo a evaluar
+      if (allLabels[CONFIG.PROCESSED_LABEL_NAME]) {
+        thread.addLabel(allLabels[CONFIG.PROCESSED_LABEL_NAME]);
       }
     }
 
@@ -301,71 +295,17 @@ function processDTEAttachments() {
 }
 
 // ====================================================================================
-// === FUNCIONES DE VALIDACIÓN INICIAL Y AUTOCURACIÓN ===
-// ====================================================================================
-
-/**
-  * Verifica y crea de forma anticipada TODAS las etiquetas en Gmail (incluso si no hay correos).
-  */
-function setupLabels() {
-  var labels = {};
-  COMPANIES.forEach(c => {
-    var labelCompras = c.name + (CONFIG.LABEL_COMPRAS_SUFFIX || '-Compras');
-    var labelVentas = c.name + (CONFIG.LABEL_VENTAS_SUFFIX || '-Ventas');
-
-    labels[labelCompras] = GmailApp.getUserLabelByName(labelCompras) || GmailApp.createLabel(labelCompras);
-    labels[labelVentas] = GmailApp.getUserLabelByName(labelVentas) || GmailApp.createLabel(labelVentas);
-  });
-
-  labels[CONFIG.FOLDER_NO_PROCESADO] = GmailApp.getUserLabelByName(CONFIG.FOLDER_NO_PROCESADO) || GmailApp.createLabel(CONFIG.FOLDER_NO_PROCESADO);
-  labels[CONFIG.LABEL_OTROS] = GmailApp.getUserLabelByName(CONFIG.LABEL_OTROS) || GmailApp.createLabel(CONFIG.LABEL_OTROS);
-
-  Logger.log('>>> [ETIQUETAS] Verificación completa de etiquetas en Gmail.');
-  return labels;
-}
-
-/**
-  * Obtiene la carpeta raíz de Google Drive por su ID. Si no existe o el usuario la borró,
-  * busca si hay una carpeta con ese nombre o la crea automáticamente.
-  */
-function getOrCreateRootFolder() {
-  var rootFolder;
-  if (CONFIG.DTE_ROOT_FOLDER_ID && CONFIG.DTE_ROOT_FOLDER_ID.trim() !== '') {
-    try {
-      rootFolder = DriveApp.getFolderById(CONFIG.DTE_ROOT_FOLDER_ID);
-      if (rootFolder.isTrashed()) {
-        throw new Error("La carpeta configurada está en la papelera.");
-      }
-      return rootFolder;
-    } catch (e) {
-      Logger.log('⚠️ ADVERTENCIA: ID de carpeta inaccesible o eliminado (' + CONFIG.DTE_ROOT_FOLDER_ID + '). Creando o buscando por nombre...');
-    }
-  }
-
-  var existingFolders = DriveApp.getFoldersByName(CONFIG.DTE_ROOT_FOLDER_NAME);
-  while (existingFolders.hasNext()) {
-    var folder = existingFolders.next();
-    if (!folder.isTrashed()) {
-      Logger.log('✔ Carpeta encontrada por nombre: ' + folder.getName() + ' (ID: ' + folder.getId() + ')');
-      return folder;
-    }
-  }
-
-  rootFolder = DriveApp.createFolder(CONFIG.DTE_ROOT_FOLDER_NAME);
-  Logger.log('✔ Carpeta raíz creada automáticamente: ' + CONFIG.DTE_ROOT_FOLDER_NAME + ' (ID: ' + rootFolder.getId() + ')');
-  return rootFolder;
-}
-
-// ====================================================================================
-// === FUNCIONES AUXILIARES Y DE SOPORTE ===
+// === FUNCIONES DE APOYO Y AUXILIARES ===
 // ====================================================================================
 
 function buildMissingCounterpartRecord(t, type, missingFormat, receivedFileName, json, errorLogSheet, extUrl) {
   var fmt = missingFormat.toUpperCase();
   var received = cleanFileName(receivedFileName);
+  
   if (errorLogSheet) {
     logToErrorSheet(errorLogSheet, 'Falta contraparte ' + fmt, received, t, 'Se recibió "' + received + '" pero no su ' + fmt);
   }
+  
   return {
     attachment: null,
     from: t.from,
@@ -375,7 +315,7 @@ function buildMissingCounterpartRecord(t, type, missingFormat, receivedFileName,
     fileFormat: fmt.toLowerCase(),
     type: type,
     threadPermalink: t.permalink,
-    externalUrl: extUrl || 'N/A',
+    externalUrl: extUrl || '', 
     fechaEmision: (json && json.identificacion) ? json.identificacion.fecEmi : '',
     codigo: getCodigoGeneracion(json) || extractGuidFromName(receivedFileName),
     isMissing: true
@@ -402,16 +342,54 @@ function registerOrphanAssets(assets, usedAssets, threadData, classification, er
   return { records: orphanRecords, classification: finalClassif };
 }
 
+
+function getNit(obj, path) {
+  if (!obj) return null;
+
+  // Lista expandida de rutas para cubrir todas las variaciones de archivos DTE
+  var pathsToSearch = Array.isArray(path) ? path : [
+    path,
+    'nit', 'doi', 'documento', 'numDocumento', 'numeroDocumento',
+    'emisor.nit', 'emisor.doi', 'emisor.documento', 'emisor.numDocumento', 'emisor.dte.nit',
+    'receptor.nit', 'receptor.doi', 'receptor.documento', 'receptor.numDocumento', 'cliente.dte.nit',
+    'donante.nit', 'donatario.nit'
+  ];
+
+  for (var i = 0; i < pathsToSearch.length; i++) {
+    var keys = pathsToSearch[i].split('.');
+    var target = obj;
+
+    for (var k = 0; k < keys.length; k++) {
+      if (target && Object.prototype.hasOwnProperty.call(target, keys[k])) {
+        target = target[keys[k]];
+      } else {
+        target = null;
+        break;
+      }
+    }
+
+    if (target) {
+      var rawVal = (typeof target === 'object') 
+        ? (target.nit || target.doi || target.numDocumento || target.numeroDocumento || target.documento || '') 
+        : target;
+
+      var val = (rawVal || '').toString().trim();
+      if (val) return val.replace(/-/g, '');
+    }
+  }
+  return null;
+}
+
 function identifyCompany(jsonData) {
-  var emisor = getNit(jsonData, 'emisor') || getNit(jsonData, 'donante');
-  var receptor = getNit(jsonData, 'receptor') || getNit(jsonData, 'donatario') || getNit(jsonData, 'documento');
+  var emisor = getNit(jsonData, 'emisor');
+  var receptor = getNit(jsonData, 'receptor');
   
   for (var i = 0; i < COMPANIES.length; i++) {
     var c = COMPANIES[i];
     var nitList = Array.isArray(c.nit) ? c.nit : [c.nit];
     
-    if (nitList.indexOf(emisor) !== -1) return { name: c.name, type: 'Ventas', label: c.name + (CONFIG.LABEL_VENTAS_SUFFIX || '-Ventas') };
-    if (nitList.indexOf(receptor) !== -1) return { name: c.name, type: 'Compras', label: c.name + (CONFIG.LABEL_COMPRAS_SUFFIX || '-Compras') };
+    if (emisor && nitList.indexOf(emisor) !== -1) return { name: c.name, type: 'Ventas', label: c.name + (CONFIG.LABEL_VENTAS_SUFFIX || '-Ventas') };
+    if (receptor && nitList.indexOf(receptor) !== -1) return { name: c.name, type: 'Compras', label: c.name + (CONFIG.LABEL_COMPRAS_SUFFIX || '-Compras') };
   }
   return { name: CONFIG.FOLDER_NO_PROCESADO, type: 'DTE', label: CONFIG.FOLDER_NO_PROCESADO };
 }
@@ -438,7 +416,6 @@ function scanExternalLinks(message, threadData, errorLogSheet) {
   var foundAsset = null;
   var jsonData = null;
   var jsonUrlSource = '';
-  var assetUrlSource = '';
 
   for (var url of links) {
     try {
@@ -463,7 +440,6 @@ function scanExternalLinks(message, threadData, errorLogSheet) {
                 }
               } else if (extName.endsWith('.pdf') || extName.endsWith('.xml')) {
                 foundAsset = extractedFiles[e];
-                assetUrlSource = url;
               }
             }
           } catch (zipErr) {}
@@ -477,7 +453,6 @@ function scanExternalLinks(message, threadData, errorLogSheet) {
           }
         } else if (!foundAsset && ct.includes('pdf')) {
           foundAsset = blob;
-          assetUrlSource = url;
         }
       }
     } catch (e) {}
@@ -498,7 +473,7 @@ function scanExternalLinks(message, threadData, errorLogSheet) {
       var ext = foundAsset.getName().split('.').pop().toLowerCase();
       if (ext !== 'json') {
         foundAsset.setName(cod + "." + ext);
-        records.push(createRecord(foundAsset, threadData, ext, classif.label, jsonData, assetUrlSource));
+        records.push(createRecord(foundAsset, threadData, ext, classif.label, jsonData, jsonUrlSource));
       }
     } else {
       records.push(buildMissingCounterpartRecord(threadData, classif.label, 'PDF', cod + ".json", jsonData, errorLogSheet, jsonUrlSource));
@@ -509,16 +484,12 @@ function scanExternalLinks(message, threadData, errorLogSheet) {
   return { success: false };
 }
 
+
 function saveThreadData(configs, classif, records, threadData, monthNames, errorLogSheet) {
   var result = { saved: 0, duplicates: 0 };
   if (!records || records.length === 0) return result;
 
   var scriptTimeZone = Session.getScriptTimeZone();
-  var localDate = new Date(Utilities.formatDate(threadData.date, scriptTimeZone, "yyyy-MM-dd HH:mm:ss"));
-  var year = localDate.getFullYear();
-  var monthName = monthNames[localDate.getMonth()];
-  var monthNum = (localDate.getMonth() + 1).toString().padStart(2, '0');
-
   var folderCache = {};
 
   records.forEach(function(r) {
@@ -526,6 +497,13 @@ function saveThreadData(configs, classif, records, threadData, monthNames, error
     var config = configs.find(c => c.name === companyName) || configs[0];
 
     if (!config) return;
+
+   
+    var recordDate = r.emailDate ? new Date(r.emailDate) : threadData.date;
+    var localDate = new Date(Utilities.formatDate(recordDate, scriptTimeZone, "yyyy-MM-dd HH:mm:ss"));
+    var year = localDate.getFullYear(); // AÑO REAL (2025, 2026, etc.)
+    var monthName = monthNames[localDate.getMonth()];
+    var monthNum = (localDate.getMonth() + 1).toString().padStart(2, '0');
 
     var dedupKey = buildDedupKey(r);
     var dedupIndex = dedupKey ? getDedupeIndex(config) : null;
@@ -551,13 +529,14 @@ function saveThreadData(configs, classif, records, threadData, monthNames, error
       folderType = CONFIG.FOLDER_NO_PROCESADO;
     }
 
+
     var cacheKey = config.name + '_' + year + '_' + monthNum + '_' + folderType;
     var targetFolder;
 
     if (folderCache[cacheKey]) {
       targetFolder = folderCache[cacheKey];
     } else {
-      var yearDir = year + ' - ' + config.name;
+      var yearDir = year + ' - ' + config.name; // Ej: "2025 - ATS Group"
       var monthDir = monthNum + '-' + monthName + '-' + year + ' - ' + config.name;
 
       var yearFolder = getOrCreateFolder(config.folder, yearDir);
@@ -600,6 +579,7 @@ function saveThreadData(configs, classif, records, threadData, monthNames, error
       r.codigo || ''
     ];
 
+   
     var written = writeDataToSheetImmediately(config.sheet, [row], config.sheetName);
 
     if (written) {
@@ -669,29 +649,27 @@ function getOrCreateFolder(parent, name) {
   return iter.hasNext() ? iter.next() : parent.createFolder(name);
 }
 
-function getNit(obj, path) {
-  if (!obj) return null;
-  if (Array.isArray(path)) {
-    for (var i = 0; i < path.length; i++) {
-      var res = getNit(obj, path[i]);
-      if (res) return res;
-    }
-    return null;
-  }
-  var keys = path.split('.');
-  var target = obj;
-  for (var k = 0; k < keys.length; k++) {
-    if (target && Object.prototype.hasOwnProperty.call(target, keys[k])) {
-      target = target[keys[k]];
-    } else {
-      target = null;
-      break;
+function getOrCreateRootFolder() {
+  var rootFolder;
+  if (CONFIG.DTE_ROOT_FOLDER_ID && CONFIG.DTE_ROOT_FOLDER_ID.trim() !== '') {
+    try {
+      rootFolder = DriveApp.getFolderById(CONFIG.DTE_ROOT_FOLDER_ID);
+      if (rootFolder.isTrashed()) {
+        throw new Error("La carpeta configurada está en la papelera.");
+      }
+      return rootFolder;
+    } catch (e) {
+      Logger.log('⚠️ ID inaccesible o en papelera. Buscando por nombre...');
     }
   }
-  if (!target) return null;
-  var rawVal = (typeof target === 'object') ? (target.nit || target.numDocumento || target.numeroDocumento || '') : target;
-  var val = (rawVal || '').toString().trim();
-  return val ? val.replace(/-/g, '') : null;
+
+  var existingFolders = DriveApp.getFoldersByName(CONFIG.DTE_ROOT_FOLDER_NAME);
+  while (existingFolders.hasNext()) {
+    var folder = existingFolders.next();
+    if (!folder.isTrashed()) return folder;
+  }
+
+  return DriveApp.createFolder(CONFIG.DTE_ROOT_FOLDER_NAME);
 }
 
 function getExt(name) { return name.split('.').pop().toLowerCase(); }
@@ -744,6 +722,27 @@ function writeDataToSheetImmediately(sheet, rows, name) {
     }
   }
   return false;
+}
+
+
+function setupLabels() {
+  var labels = {};
+  COMPANIES.forEach(c => {
+    var labelCompras = c.name + (CONFIG.LABEL_COMPRAS_SUFFIX || '-Compras');
+    var labelVentas = c.name + (CONFIG.LABEL_VENTAS_SUFFIX || '-Ventas');
+
+    labels[labelCompras] = GmailApp.getUserLabelByName(labelCompras) || GmailApp.createLabel(labelCompras);
+    labels[labelVentas] = GmailApp.getUserLabelByName(labelVentas) || GmailApp.createLabel(labelVentas);
+  });
+
+  labels[CONFIG.FOLDER_NO_PROCESADO] = GmailApp.getUserLabelByName(CONFIG.FOLDER_NO_PROCESADO) || GmailApp.createLabel(CONFIG.FOLDER_NO_PROCESADO);
+  labels[CONFIG.LABEL_OTROS] = GmailApp.getUserLabelByName(CONFIG.LABEL_OTROS) || GmailApp.createLabel(CONFIG.LABEL_OTROS);
+  
+  if (CONFIG.PROCESSED_LABEL_NAME) {
+    labels[CONFIG.PROCESSED_LABEL_NAME] = GmailApp.getUserLabelByName(CONFIG.PROCESSED_LABEL_NAME) || GmailApp.createLabel(CONFIG.PROCESSED_LABEL_NAME);
+  }
+
+  return labels;
 }
 
 function setupCompanyConfigs(root, headers) {
