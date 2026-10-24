@@ -1,86 +1,65 @@
 /**
- * ====================================================================================
- * SCRIPT DE EXTRACCIÓN Y ORGANIZACIÓN DE DTE DESDE GMAIL (GOOGLE APPS SCRIPT) - v3
- * ====================================================================================
+ * EXTRACCIÓN Y ORGANIZACIÓN DE DTE DESDE GMAIL - v4
  *
- * ¿QUÉ HACE ESTE SCRIPT?
- * Revisa la bandeja de entrada de Gmail, encuentra los Documentos Tributarios Electrónicos (DTE
- * de El Salvador) que llegan por correo, los guarda ordenados en Google Drive y deja un registro
- * de cada archivo en una hoja de cálculo por empresa.
+ * Busca en Gmail los DTE (JSON / PDF / XML, sueltos o en ZIP), los clasifica por empresa
+ * (Compras / Ventas) según el NIT, los guarda en Drive por fecha de emisión y registra cada
+ * archivo en la hoja "<Empresa> - Registros DTE".
  *
- * FLUJO GENERAL (función de entrada: processDTEAttachments, pensada para un trigger por tiempo):
- *  1. Busca hilos nuevos: "in:inbox has:nouserlabels" (los ya procesados quedan con etiqueta).
- *  2. Por cada mensaje obtiene los adjuntos; si hay .zip los descomprime en memoria y toma los
- *     .json / .pdf / .xml 
- *  3. Si hay JSON: lo lee (reparándolo si viene roto), identifica la empresa por NIT (emisor =
- *     Ventas, receptor = Compras) y busca su PDF/XML pareja por nombre o por enlace externo.
- *  4. Si NO hay JSON adjunto: sondea los enlaces del correo (portales tipo Walmart/Edicom) para
- *     descargar JSON/PDF/ZIP; si el portal está protegido usa los datos del texto del correo.
- *  5. Valida SIEMPRE la pareja PDF + JSON: si falta uno deja un registro "PDF - No encontrado" o
- *     "JSON - No encontrado" indicando de qué archivo recibido es contraparte (y lo anota en el log).
- *  6. ANTI-DUPLICADOS: antes de guardar, verifica por Código de Generación + formato si ese archivo
- *     ya fue registrado; si ya existe lo omite (no lo sube a Drive ni agrega fila). Ver módulo
- *     "ANTI-DUPLICADOS" más abajo.
- *  7. Guarda los archivos en Drive: <Empresa>/<Año - Empresa>/<MM-Mes-Año - Empresa>/<Compras|Ventas - Empresa>
- *     y agrega una fila por archivo en "<Empresa> - Registros DTE". Lo no identificado va a "No procesado".
- *  8. Etiqueta el hilo en Gmail (<Empresa>-Compras / -Ventas / No procesado / Otros) para no reprocesarlo.
+ * Entrada: processDTEAttachments (trigger por tiempo).
+ * Drive:   <Empresa>/<Año - Empresa>/<MM-Mes-Año - Empresa>/<Compras|Ventas - Empresa>
+ * Gmail:   una etiqueta por hilo bajo "DTE/": <Empresa>-Compras, <Empresa>-Ventas, No procesado u Otros.
  *
- * SALIDAS:
- *  - Archivos en Drive en carpeta raíz
- *  - Una hoja "<Empresa> - Registros DTE" por empresa (columnas en SHEET_HEADERS).
- *  - Hoja "Log de Errores DTE": errores de ZIP, JSON corruptos, fallos de descarga, faltantes de
- *    pareja y duplicados omitidos.
- *  - Correo de alerta al administrador solo ante un fallo crítico general.
- *
- * CONFIGURACIÓN (sección CONFIGURACIÓN GLOBAL): empresas y NITs en COMPANIES, carpeta raíz,
- *  correo del administrador y la opción ORPHAN_REQUIRE_DTE_NAME.
- *
- * PROTECCIONES: bloqueo (LockService) para que no corran dos ejecuciones a la vez, corte seguro
- *  por tiempo, reintentos al escribir en la hoja y limpieza de JSONs con caracteres inválidos.
- *
- * HISTORIAL DE CAMBIOS (buscar "[CAMBIO v3" en el código):
- *  - v3: el PDF/XML encontrado hereda la "Fecha de Emisión DTE" de su JSON.
- *  - v3 :se quita la ruta interna del ZIP en el nombre de archivo (cleanFileName).
- *  - v3 : validación de pareja PDF + JSON con registro de faltantes.
- *  - v3 : control de duplicados por Código de Generación, nueva columna "Código de Generación"
- *    y bloqueo de ejecuciones simultáneas.
+ * Requiere el servicio avanzado "Drive API" para leer el texto de los PDF que llegan sin JSON.
  */
 
 // ====================================================================================
-// === CONFIGURACIÓN GLOBAL ===
+// === CONFIGURACIÓN ===
 // ====================================================================================
 
-
 var CONFIG = {
-  // 1. Datos de Identificación del Cliente
-  CLIENT_NAME: 'ATS Group', 
-  CLIENT_NITS: ["03151306811028"], 
+  CLIENT_NAME: 'ATS Group',
+  // Una entrada por empresa. NIT con o sin guiones; para personas naturales agregar también el DUI.
+  COMPANIES: [
+    { name: 'ATS Group', nits: ['03151306811028'] },
+    { name: 'Marlene', nits: ['02073991-2','020739912'] },
+    { name: 'Eventomania', nits: ['06142801131019'] }
+  ],
 
-  // 2. Comunicaciones y Notificaciones
-  RECIPIENT_EMAIL: 'facturacion.atsgroup@gmail.com', 
+  RECIPIENT_EMAIL: 'facturacion.atsgroup@gmail.com',
 
-  // 3. IDs y Nombres de Google Drive
-  DTE_ROOT_FOLDER_ID: '1HEE3Y_rrb2mTKuCEITrtHB1-J5W_kxNs', 
+  DTE_ROOT_FOLDER_ID: '10z96hTPJyczJD9e--FFHWk1b19rFqIfl', // Modificar dirección de Drive
   DTE_ROOT_FOLDER_NAME: 'Registros DTE',
   ERROR_LOG_NAME: 'Log de Errores DTE',
 
-  // 4. Nombres de Carpetas y Etiquetas en Gmail
-  FOLDER_NO_PROCESADO: 'No procesado -TEST',
+  LABEL_PARENT: 'DTE',
+  FOLDER_NO_PROCESADO: 'No procesado',
   LABEL_OTROS: 'Otros',
   LABEL_COMPRAS_SUFFIX: '-Compras',
   LABEL_VENTAS_SUFFIX: '-Ventas',
-  PROCESSED_LABEL_NAME: 'DTE-Procesado', 
-  GMAIL_SEARCH_QUERY: 'in:inbox -label:DTE-Procesado', 
+  LEGACY_LABELS: ['DTE-Procesado'],
 
-  // 5. Textos de Mensajes y Etiquetas Especiales
+  GMAIL_SEARCH_SCOPE: '-in:chats -in:drafts',
+  GMAIL_SEARCH_AFTER: '', 
+  GMAIL_SEARCH_QUERY: '', 
+  GMAIL_PAGE_SIZE: 100,
+
   LABEL_PDF_MISSING: 'PDF - No encontrado',
   LABEL_JSON_MISSING: 'JSON - No encontrado',
 
-  // 6. Tiempos de Ejecución y Parámetros del Motor
-  MAX_EXECUTION_TIME_MS: 5 * 60 * 1000, // 5 minutos
-  SAFETY_MARGIN_MS: 30 * 1000,          // 30 segundos        
+  MAX_LINKS_PER_MESSAGE: 6,
+  ENABLE_PDF_OCR: true,
+  DTE_KEYWORDS: [
+    'dte', 'factura', 'comprobante', 'crédito fiscal', 'credito fiscal', 'código de generación',
+    'codigo de generacion', 'documento tributario', 'nota de crédito', 'nota de credito',
+    'nota de débito', 'nota de debito', 'sujeto excluido', 'retención', 'retencion', 'hacienda'
+  ],
 
-  // 7. Configuración de Hojas de Cálculo
+  // Tipos de DTE que emite el comprador (14 = Sujeto Excluido): se invierte Compras/Ventas.
+  INVERTED_DTE_TYPES: ['14'],
+
+  MAX_EXECUTION_TIME_MS: 5 * 60 * 1000,
+  SAFETY_MARGIN_MS: 30 * 1000,
+
   MONTH_NAMES: [
     "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
     "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"
@@ -89,202 +68,111 @@ var CONFIG = {
     'Tipo de DTE', 'Remitente del Correo', 'Asunto del Correo', 'Fecha del Correo Original',
     'Mes', 'Año', 'Nombre del Archivo Adjunto', 'Formato', 'URL del Archivo en Drive',
     'Ruta Carpeta Destino', 'Fecha de Emisión DTE', 'Ver correo', 'Fecha de Proceso',
-    'URL Externa', 'Código de Generación'
+    'URL Externa', 'Código de Generación', 'Tipo de Documento'
   ]
 };
 
-var COMPANIES = [
-  { name: CONFIG.CLIENT_NAME, nit: CONFIG.CLIENT_NITS }
-];
+var COMPANIES = CONFIG.COMPANIES;
 
+// Un PDF/XML sin JSON solo se registra si tiene Código de Generación (en nombre o contenido).
 var ORPHAN_REQUIRE_DTE_NAME = true;
 var GENERIC_CODES = ['dte_externo', 'dte_portal_externo', 'dte_complementario'];
 var GUID_REGEX = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
+var DTE_TYPE_NAMES = {
+  '01': 'Factura',
+  '03': 'Comprobante de Crédito Fiscal',
+  '04': 'Nota de Remisión',
+  '05': 'Nota de Crédito',
+  '06': 'Nota de Débito',
+  '07': 'Comprobante de Retención',
+  '08': 'Comprobante de Liquidación',
+  '09': 'Documento Contable de Liquidación',
+  '11': 'Factura de Exportación',
+  '14': 'Factura de Sujeto Excluido',
+  '15': 'Comprobante de Donación'
+};
+
+var NIT_KEYS = ['dte', 'nit', 'doi', 'numDocumento', 'numeroDocumento', 'documento', 'numDoc', 'id', 'numId', 'identificacion'];
+
+var IGNORED_LINK_DOMAINS = [
+  'google.com', 'facebook.com', 'twitter.com', 'x.com', 'instagram.com', 'linkedin.com',
+  'youtube.com', 'whatsapp.com', 'wa.me', 'schema.org', 'w3.org', 'apple.com'
+];
+var IGNORED_LINK_PATTERN = /unsubscribe|unsuscrib|desuscri|dar-?de-?baja|darse-?de-?baja|[?&\/=]baja\b|opt-?out|preferenc|\/track|pixel|\.(png|jpe?g|gif|svg|css|js|ico|woff2?)(\?|$)/i;
+var PREFERRED_LINK_PATTERN = /dte|factura|invoice|pdf|json|zip|descarg|download|document|comprobante|consulta|archivo/i;
+
 // ====================================================================================
-// === MOTOR PRINCIPAL (PUNTO DE ENTRADA PARA EL TRIGGER) ===
+// === MOTOR PRINCIPAL ===
 // ====================================================================================
 
 function processDTEAttachments() {
   var startTime = new Date().getTime();
-  
+
   function shouldStopExecution() {
     return (new Date().getTime() - startTime) > (CONFIG.MAX_EXECUTION_TIME_MS - CONFIG.SAFETY_MARGIN_MS);
   }
 
   var lock = LockService.getScriptLock();
-  
   if (!lock.tryLock(10000)) {
-    Logger.log('>>> [BLOQUEO] Ya hay otra ejecución en curso. Se cancela esta para evitar duplicados.');
+    Logger.log('>>> [BLOQUEO] Ya hay otra ejecución en curso.');
     return;
   }
 
   try {
-    Logger.log('>>> [INICIO] Ejecutando motor optimizado DTE');
+    Logger.log('>>> [INICIO] Ejecutando motor DTE');
 
     var allLabels = setupLabels();
     var dteMainFolder = getOrCreateRootFolder();
     var configs = setupCompanyConfigs(dteMainFolder, CONFIG.SHEET_HEADERS);
     var errorLogSheet = setupErrorLog(dteMainFolder);
+    var ctx = { labels: allLabels, configs: configs, errorLogSheet: errorLogSheet, threadCodeMeta: {} };
 
-    
-    var threads = GmailApp.search(CONFIG.GMAIL_SEARCH_QUERY);
-    Logger.log('>>> [BANDEJA] ' + threads.length + ' hilos de correo por procesar.');
+    var searchQuery = CONFIG.GMAIL_SEARCH_QUERY || buildGmailSearchQuery();
+    Logger.log('>>> [BANDEJA] Query: ' + searchQuery);
 
-    var stats = { processed: 0, files: 0, duplicates: 0, others: 0, executionStopped: false };
+    var stats = { threads: 0, processed: 0, files: 0, duplicates: 0, others: 0, failed: 0, executionStopped: false };
+    var pageSize = CONFIG.GMAIL_PAGE_SIZE || 100;
+    // Los hilos etiquetados salen de la búsqueda; offset solo avanza por los que quedan sin etiqueta.
+    var offset = 0;
 
-    for (var i = 0; i < threads.length; i++) {
-      if (shouldStopExecution()) {
-        stats.executionStopped = true;
-        Logger.log('>>> [CRONÓMETRO] Límite de tiempo alcanzado. Deteniendo ejecución de forma segura...');
-        break;
-      }
+    pageLoop:
+    while (true) {
+      var threads = GmailApp.search(searchQuery, offset, pageSize);
+      if (threads.length === 0) break;
 
-      var thread = threads[i];
-      var threadMessages = thread.getMessages();
-      var firstMsgSubject = threadMessages[0].getSubject().toLowerCase();
-      var firstMsgFrom = threadMessages[0].getFrom().toLowerCase();
-
-      // Ignorar correos de alerta/sistema
-      if (firstMsgSubject.includes('dte script crítico') || firstMsgSubject.includes('security alert') || firstMsgFrom.includes('no-reply@accounts.google.com')) {
-        thread.addLabel(allLabels[CONFIG.LABEL_OTROS]);
-        if (allLabels[CONFIG.PROCESSED_LABEL_NAME]) thread.addLabel(allLabels[CONFIG.PROCESSED_LABEL_NAME]);
-        stats.others++;
-        continue;
-      }
-
-      var threadPermalink = thread.getPermalink();
-      var classification = null;
-      var records = [];
-
-      for (var msgIndex = 0; msgIndex < threadMessages.length; msgIndex++) {
-        var currentMessage = threadMessages[msgIndex];
-        var threadData = {
-          subject: currentMessage.getSubject(),
-          from: currentMessage.getFrom(),
-          date: currentMessage.getDate(), 
-          permalink: threadPermalink,
-          id: currentMessage.getId()
-        };
-        
-        Logger.log('ANALIZANDO MSG [' + msgIndex + ']: "' + threadData.subject + '" de ' + threadData.from);
-
-        var rawAttachments = currentMessage.getAttachments();
-        var processedAttachments = [];
-        
-        for (var a = 0; a < rawAttachments.length; a++) {
-          var att = rawAttachments[a];
-          var name = att.getName().toLowerCase();
-          
-          if (name.endsWith('.zip')) {
-            try {
-              var extractedFiles = Utilities.unzip(att);
-              for (var e = 0; e < extractedFiles.length; e++) {
-                var extractedName = extractedFiles[e].getName().toLowerCase();
-                if (extractedName.endsWith('.json') || extractedName.endsWith('.pdf') || extractedName.endsWith('.xml')) {
-                  extractedFiles[e].setName(cleanFileName(extractedFiles[e].getName()));
-                  processedAttachments.push(extractedFiles[e]);
-                }
-              }
-            } catch (zipErr) {
-              logToErrorSheet(errorLogSheet, "Error ZIP", att.getName(), threadData, zipErr.toString());
-              processedAttachments.push(att); 
-            }
-          } else {
-            processedAttachments.push(att);
-          }
+      for (var i = 0; i < threads.length; i++) {
+        if (shouldStopExecution()) {
+          stats.executionStopped = true;
+          break pageLoop;
         }
 
-        var nativeJsons = processedAttachments.filter(a => a.getName().toLowerCase().endsWith('.json'));
-        var nativeAssets = processedAttachments.filter(a => {
-          var n = a.getName().toLowerCase();
-          return n.endsWith('.pdf') || n.endsWith('.xml');
-        });
+        var thread = threads[i];
+        stats.threads++;
 
-        var usedAssets = [];
-
-        if (nativeJsons.length > 0) {
-          nativeJsons.forEach(function(currentJson) {
-            var jsonContentString = currentJson.getDataAsString('UTF-8');
-            var jsonData = parseJSONSafe(jsonContentString, currentJson.getName(), errorLogSheet, threadData);
-            
-            if (jsonData) {
-              var tempClassif = identifyCompany(jsonData);
-              if (!classification || classification.name === CONFIG.FOLDER_NO_PROCESADO) {
-                classification = tempClassif; 
-              }
-              
-              records.push(createRecord(currentJson, threadData, 'json', tempClassif.label, jsonData));
-              
-              var rawJsonName = cleanFileName(currentJson.getName()).toLowerCase();
-              var baseName = rawJsonName.substring(0, rawJsonName.lastIndexOf('.'));
-              
-              var matchingAsset = nativeAssets.find(a => {
-                return cleanFileName(a.getName()).toLowerCase().includes(baseName);
-              });
-
-              if (!matchingAsset && nativeAssets.length === 1 && nativeJsons.length === 1) {
-                matchingAsset = nativeAssets[0];
-              }
-
-              if (matchingAsset) {
-                usedAssets.push(matchingAsset);
-                records.push(createRecord(matchingAsset, threadData, getExt(matchingAsset.getName()), tempClassif.label, jsonData));
-              } else {
-                var downloaded = attemptDownloadExternalFile(currentMessage, "DTE_Complementario", threadData, errorLogSheet);
-                if (downloaded && !downloaded.logError && getExt(downloaded.getName()) !== 'html') {
-                  records.push(createRecord(downloaded, threadData, getExt(downloaded.getName()), tempClassif.label, jsonData, downloaded.externalUrlSource));
-                } else {
-                  var triedUrl = downloaded ? (downloaded.externalUrlSource || downloaded.url || '') : '';
-                  records.push(buildMissingCounterpartRecord(threadData, tempClassif.label, 'PDF', currentJson.getName(), jsonData, errorLogSheet, triedUrl));
-                }
-              }
-            }
-          });
-
-          var orphanA = registerOrphanAssets(nativeAssets, usedAssets, threadData, classification, errorLogSheet);
-          records = records.concat(orphanA.records);
-          classification = orphanA.classification;
-        } else {
-          var scan = scanExternalLinks(currentMessage, threadData, errorLogSheet);
-          if (scan.success) {
-            records = records.concat(scan.records);
-            if (!classification || classification.name === CONFIG.FOLDER_NO_PROCESADO) {
-              classification = scan.classification;
-            }
-          } else if (nativeAssets.length > 0) {
-            var orphanB = registerOrphanAssets(nativeAssets, [], threadData, classification, errorLogSheet);
-            records = records.concat(orphanB.records);
-            classification = orphanB.classification;
-          }
+        if (threadHasOwnLabel(thread, allLabels)) {
+          offset++;
+          continue;
         }
-      }
 
-      if (classification && records.length > 0) {
-        var baseThreadData = {
-            subject: threadMessages[0].getSubject(),
-            from: threadMessages[0].getFrom(),
-            date: threadMessages[0].getDate(),
-            permalink: threadPermalink
-        };
-        var saveResult = saveThreadData(configs, classification, records, baseThreadData, CONFIG.MONTH_NAMES, errorLogSheet);
-        thread.addLabel(allLabels[classification.label]);
-        stats.processed++;
-        stats.files += saveResult.saved;
-        stats.duplicates += saveResult.duplicates;
-      } else {
-        thread.addLabel(allLabels[CONFIG.LABEL_OTROS]);
-        stats.others++;
-      }
-
-      // Se le marca la etiqueta de procesado para no volverlo a evaluar
-      if (allLabels[CONFIG.PROCESSED_LABEL_NAME]) {
-        thread.addLabel(allLabels[CONFIG.PROCESSED_LABEL_NAME]);
+        var labeled = false;
+        try {
+          labeled = processThread(thread, ctx, stats);
+        } catch (threadErr) {
+          stats.failed++;
+          Logger.log('>>> [ERROR HILO] ' + threadErr.toString());
+          logToErrorSheet(errorLogSheet, 'Error procesando hilo', thread.getFirstMessageSubject(),
+            { from: '', subject: thread.getFirstMessageSubject(), permalink: thread.getPermalink() }, threadErr.toString());
+        }
+        if (!labeled) offset++;
       }
     }
 
     SpreadsheetApp.flush();
-    Logger.log('>>> [FIN] Procesamiento finalizado. Procesados: ' + stats.processed + ' | Archivos guardados: ' + stats.files);
+    Logger.log('>>> [FIN] Hilos revisados: ' + stats.threads + ' | Con DTE: ' + stats.processed +
+      ' | Otros: ' + stats.others + ' | Archivos guardados: ' + stats.files +
+      ' | Duplicados omitidos: ' + stats.duplicates + ' | Con error: ' + stats.failed +
+      (stats.executionStopped ? ' | Quedan hilos pendientes para la próxima ejecución.' : ''));
 
   } catch (e) {
     Logger.log('>>> [ERROR CRÍTICO GENERAL] ' + e.toString());
@@ -294,313 +182,927 @@ function processDTEAttachments() {
   }
 }
 
+/** Procesa un hilo completo. Devuelve true si quedó etiquetado. */
+function processThread(thread, ctx, stats) {
+  var threadMessages = thread.getMessages();
+  var firstMsgSubject = threadMessages[0].getSubject().toLowerCase();
+  var firstMsgFrom = threadMessages[0].getFrom().toLowerCase();
+
+  if (firstMsgSubject.includes('dte script crítico') || firstMsgSubject.includes('security alert') || firstMsgFrom.includes('no-reply@accounts.google.com')) {
+    stats.others++;
+    return applyThreadLabel(thread, ctx.labels, CONFIG.LABEL_OTROS);
+  }
+
+  var threadPermalink = thread.getPermalink();
+  var records = [];
+  ctx.threadCodeMeta = {};
+
+  threadMessages.forEach(function(message) {
+    var threadData = {
+      subject: message.getSubject(),
+      from: message.getFrom(),
+      date: message.getDate(),
+      permalink: threadPermalink
+    };
+    var assets = expandAttachments(message.getAttachments(), threadData, ctx.errorLogSheet);
+    records = records.concat(analyzeMessage(message, assets, threadData, ctx));
+  });
+
+  if (records.length > 0) {
+    var baseThreadData = {
+      subject: threadMessages[0].getSubject(),
+      from: threadMessages[0].getFrom(),
+      date: threadMessages[0].getDate(),
+      permalink: threadPermalink
+    };
+    var saveResult = saveThreadData(ctx, records, baseThreadData);
+    stats.processed++;
+    stats.files += saveResult.saved;
+    stats.duplicates += saveResult.duplicates;
+  } else {
+    stats.others++;
+  }
+
+  return applyThreadLabel(thread, ctx.labels, resolveThreadLabel(records));
+}
+
+/**
+ * Lista plana de archivos DTE candidatos ({ blob, name, fmt, dir }), descomprimiendo ZIPs
+ * (también anidados). dir identifica el ZIP y la carpeta de origen para emparejar archivos.
+ */
+function expandAttachments(rawAttachments, threadData, errorLogSheet) {
+  var assets = [];
+
+  function addBlob(blob, depth, parentDir) {
+    var fullName = (blob.getName() || '').toString();
+    var name = cleanFileName(fullName);
+    var fmt = getExt(name);
+    var dir = parentDir + fullName.substring(0, fullName.length - name.length);
+
+    if (!name || isJunkZipEntry(fullName)) return;
+
+    if (isZipAttachment(blob, fmt)) {
+      if (depth > 2) return;
+      try {
+        Utilities.unzip(blob).forEach(function(inner) { addBlob(inner, depth + 1, dir + name + '/'); });
+      } catch (zipErr) {
+        logToErrorSheet(errorLogSheet, "Error ZIP", name, threadData, zipErr.toString());
+      }
+      return;
+    }
+
+    if (fmt === 'json' || fmt === 'pdf' || fmt === 'xml') {
+      if (depth > 0) blob.setName(name);
+      assets.push({ blob: blob, name: name, fmt: fmt, dir: dir });
+    }
+  }
+
+  rawAttachments.forEach(function(att) { addBlob(att, 0, ''); });
+  return assets;
+}
+
+/** ZIP por extensión, por tipo de contenido o, si no tiene extensión conocida, por su firma. */
+function isZipAttachment(blob, fmt) {
+  if (fmt === 'zip') return true;
+  if (fmt === 'json' || fmt === 'pdf' || fmt === 'xml') return false;
+  var type = '';
+  try { type = (blob.getContentType() || '').toLowerCase(); } catch (e) {}
+  if (type.indexOf('zip') !== -1) return true;
+  return (type === '' || type.indexOf('octet-stream') !== -1) && isZipBlob(blob);
+}
+
+/** Entradas que no son documentos: carpetas y metadatos de macOS/Windows. */
+function isJunkZipEntry(path) {
+  var name = cleanFileName(path);
+  return /(^|\/)__MACOSX\//i.test(path) || name.indexOf('._') === 0 || /^(\.ds_store|thumbs\.db)$/i.test(name);
+}
+
+/** Texto de un archivo respetando BOM UTF-8 / UTF-16. */
+function readBlobText(blob) {
+  var bytes = blob.getBytes();
+  if (bytes.length >= 2 && (bytes[0] & 0xFF) === 0xFF && (bytes[1] & 0xFF) === 0xFE) return blob.getDataAsString('UTF-16LE').replace(/^\uFEFF/, '');
+  if (bytes.length >= 2 && (bytes[0] & 0xFF) === 0xFE && (bytes[1] & 0xFF) === 0xFF) return blob.getDataAsString('UTF-16BE').replace(/^\uFEFF/, '');
+  return blob.getDataAsString('UTF-8');
+}
+
+/**
+ * Registros de un mensaje: cada JSON se clasifica por separado y se empareja con su PDF/XML
+ * (por nombre, por Código de Generación en el nombre o en el contenido, o por descarte).
+ */
+function analyzeMessage(message, assets, threadData, ctx) {
+  var records = [];
+  var fetchCache = {};
+  var jsonAssets = assets.filter(function(a) { return a.fmt === 'json'; });
+  var pending = assets.filter(function(a) { return a.fmt === 'pdf' || a.fmt === 'xml'; });
+  var hasHints = messageHasDteHints(message, assets);
+  var docs = [];
+
+  jsonAssets.forEach(function(a) {
+    var parsed = parseJSONSafe(readBlobText(a.blob));
+    var dte = unwrapDte(parsed);
+    if (!dte) {
+      logToErrorSheet(ctx.errorLogSheet, parsed ? 'JSON no es DTE' : 'JSON corrupto', a.name, threadData,
+        parsed ? 'No se encontró identificación, emisor ni receptor.' : 'No se pudo leer el contenido.');
+      return;
+    }
+    docs.push({ asset: a, meta: buildDteMeta(dte, a.name), pairs: {} });
+  });
+
+  // Sin JSON adjunto: buscar el DTE en los enlaces del correo.
+  if (jsonAssets.length === 0 && hasHints) {
+    var ext = scanExternalLinks(message, threadData, ctx.errorLogSheet, fetchCache);
+    if (ext) {
+      if (ext.dte) {
+        var meta = buildDteMeta(ext.dte, '');
+        var cod = meta.codigo || 'DTE_Externo';
+        ext.jsonBlob.setName(cod + '.json');
+        docs.push({ asset: { blob: ext.jsonBlob, name: cod + '.json', fmt: 'json', url: ext.url }, meta: meta, pairs: {} });
+        if (ext.asset) {
+          ext.asset.name = cod + '.' + ext.asset.fmt;
+          ext.asset.blob.setName(ext.asset.name);
+        }
+      }
+      if (ext.asset) {
+        if (!ext.asset.name) {
+          var extName = cleanFileName(ext.asset.blob.getName()) || 'DTE_Externo';
+          ext.asset.name = getExt(extName) === ext.asset.fmt ? extName : extName + '.' + ext.asset.fmt;
+          ext.asset.blob.setName(ext.asset.name);
+        }
+        pending.push(ext.asset);
+      }
+    }
+  }
+
+  docs.forEach(function(doc) { rememberCodeMeta(ctx, doc.meta); });
+
+  // Emparejar primero por Código de Generación en el nombre (lo más seguro).
+  docs.forEach(function(doc) {
+    var code = (doc.meta.codigo || '').toLowerCase();
+    if (!code) return;
+    pending = pending.filter(function(a) {
+      if (doc.pairs[a.fmt] || a.name.toLowerCase().indexOf(code) === -1) return true;
+      doc.pairs[a.fmt] = a;
+      return false;
+    });
+  });
+
+  // Luego por nombre: primero dentro de la misma carpeta/ZIP de origen, después en cualquiera.
+  [true, false].forEach(function(sameDirOnly) {
+    docs.forEach(function(doc) {
+      var base = baseName(doc.asset.name).toLowerCase();
+      pending = pending.filter(function(a) {
+        if (doc.pairs[a.fmt]) return true;
+        if (sameDirOnly && (a.dir || '') !== (doc.asset.dir || '')) return true;
+        var n = a.name.toLowerCase();
+        var sameName = baseName(n) === base || (base.length >= 6 && n.indexOf(base) !== -1);
+        if (!sameName) return true;
+        doc.pairs[a.fmt] = a;
+        return false;
+      });
+    });
+  });
+
+  // Emparejar por Código de Generación dentro del contenido.
+  var docsWithoutPair = function(fmt) { return docs.filter(function(d) { return !d.pairs[fmt] && d.meta.codigo; }); };
+  if (pending.length > 0 && (docsWithoutPair('pdf').length > 0 || docsWithoutPair('xml').length > 0)) {
+    pending = pending.filter(function(a) {
+      var candidates = docsWithoutPair(a.fmt);
+      if (candidates.length === 0) return true;
+      var codes = extractInfoFromText(getAssetText(a)).codigos;
+      var doc = candidates.find(function(d) { return codes.indexOf(d.meta.codigo) !== -1; });
+      if (!doc) return true;
+      doc.pairs[a.fmt] = a;
+      return false;
+    });
+  }
+
+  // Por descarte: un solo JSON y un solo archivo de ese formato.
+  ['pdf', 'xml'].forEach(function(fmt) {
+    var lonelyDocs = docs.filter(function(d) { return !d.pairs[fmt]; });
+    var lonelyAssets = pending.filter(function(a) { return a.fmt === fmt; });
+    if (lonelyDocs.length === 1 && lonelyAssets.length === 1 && docs.length === 1) {
+      lonelyDocs[0].pairs[fmt] = lonelyAssets[0];
+      pending.splice(pending.indexOf(lonelyAssets[0]), 1);
+    }
+  });
+
+  var docsMissingPdf = docs.filter(function(d) { return !d.pairs.pdf; });
+  docs.forEach(function(doc) {
+    records.push(createRecord(doc.asset, threadData, doc.meta, doc.asset.url));
+    if (doc.pairs.xml) records.push(createRecord(doc.pairs.xml, threadData, doc.meta, doc.pairs.xml.url));
+
+    if (doc.pairs.pdf) {
+      records.push(createRecord(doc.pairs.pdf, threadData, doc.meta, doc.pairs.pdf.url));
+      return;
+    }
+
+    if (isAlreadyRegistered(ctx, doc.meta.codigo, 'pdf')) return;
+
+    var detail = '';
+    // Solo se descarga si hay un único JSON sin PDF (si no, no se sabe a cuál pertenece).
+    if (docsMissingPdf.length === 1) {
+      var downloaded = attemptDownloadExternalFile(message, doc.meta.codigo || 'DTE_Complementario', fetchCache);
+      if (downloaded && downloaded.blob) {
+        records.push(createRecord({ blob: downloaded.blob, name: downloaded.blob.getName(), fmt: 'pdf' }, threadData, doc.meta, downloaded.url));
+        return;
+      }
+      if (downloaded) detail = downloaded.detail;
+    }
+    records.push(buildMissingCounterpartRecord(threadData, doc.meta, 'PDF', doc.asset.name, detail));
+  });
+
+  // Los XML primero: su contenido clasifica el documento y el PDF del mismo código lo hereda.
+  var uniqueClassif = getUniqueCompanyClassification(docs);
+  pending.sort(function(x, y) { return (x.fmt === 'xml' ? 0 : 1) - (y.fmt === 'xml' ? 0 : 1); });
+  pending.forEach(function(a) {
+    records = records.concat(buildOrphanRecords(a, threadData, ctx, hasHints, uniqueClassif));
+  });
+
+  return records;
+}
+
 // ====================================================================================
-// === FUNCIONES DE APOYO Y AUXILIARES ===
+// === LECTURA DEL DTE (JSON) ===
 // ====================================================================================
 
-function buildMissingCounterpartRecord(t, type, missingFormat, receivedFileName, json, errorLogSheet, extUrl) {
-  var fmt = missingFormat.toUpperCase();
-  var received = cleanFileName(receivedFileName);
-  
-  if (errorLogSheet) {
-    logToErrorSheet(errorLogSheet, 'Falta contraparte ' + fmt, received, t, 'Se recibió "' + received + '" pero no su ' + fmt);
-  }
-  
+function buildDteMeta(dte, fileName) {
+  var tipoCodigo = getTipoDte(dte);
   return {
-    attachment: null,
-    from: t.from,
-    subject: t.subject,
-    fileName: fmt + ' - No encontrado (contraparte de: ' + received + ')',
-    emailDate: t.date,
-    fileFormat: fmt.toLowerCase(),
-    type: type,
-    threadPermalink: t.permalink,
-    externalUrl: extUrl || '', 
-    fechaEmision: (json && json.identificacion) ? json.identificacion.fecEmi : '',
-    codigo: getCodigoGeneracion(json) || extractGuidFromName(receivedFileName),
-    isMissing: true
+    codigo: getCodigoGeneracion(dte) || extractGuidFromName(fileName),
+    fecha: getFechaEmision(dte),
+    tipoNombre: getTipoDteNombre(dte, tipoCodigo),
+    classif: identifyCompany(dte, tipoCodigo)
   };
 }
 
-function registerOrphanAssets(assets, usedAssets, threadData, classification, errorLogSheet) {
-  var orphanRecords = [];
-  var finalClassif = classification;
+/** Devuelve el objeto DTE aunque venga envuelto en otro objeto, arreglo o texto. */
+function unwrapDte(value, depth) {
+  depth = depth || 0;
+  if (value === null || value === undefined || depth > 4) return null;
 
-  assets.forEach(function(asset) {
-    if (usedAssets.indexOf(asset) !== -1) return;
-    var cleanName = cleanFileName(asset.getName());
-    if (ORPHAN_REQUIRE_DTE_NAME && !looksLikeDteName(cleanName)) return;
+  if (typeof value === 'string') {
+    var s = value.trim();
+    if (s.charAt(0) !== '{' && s.charAt(0) !== '[') return null;
+    return unwrapDte(parseJSONSafe(s), depth + 1);
+  }
 
-    if (!finalClassif) {
-      finalClassif = { name: CONFIG.FOLDER_NO_PROCESADO, type: 'DTE', label: CONFIG.FOLDER_NO_PROCESADO };
+  if (Array.isArray(value)) {
+    for (var i = 0; i < value.length; i++) {
+      var fromItem = unwrapDte(value[i], depth + 1);
+      if (fromItem) return fromItem;
     }
+    return null;
+  }
 
-    orphanRecords.push(createRecord(asset, threadData, getExt(asset.getName()), finalClassif.label));
-    orphanRecords.push(buildMissingCounterpartRecord(threadData, finalClassif.label, 'JSON', asset.getName(), null, errorLogSheet));
-  });
+  if (typeof value !== 'object') return null;
+  if (isDteObject(value)) return value;
 
-  return { records: orphanRecords, classification: finalClassif };
-}
-
-
-function getNit(obj, path) {
-  if (!obj) return null;
-
-  // Lista expandida de rutas para cubrir todas las variaciones de archivos DTE
-  var pathsToSearch = Array.isArray(path) ? path : [
-    path,
-    'nit', 'doi', 'documento', 'numDocumento', 'numeroDocumento',
-    'emisor.nit', 'emisor.doi', 'emisor.documento', 'emisor.numDocumento', 'emisor.dte.nit',
-    'receptor.nit', 'receptor.doi', 'receptor.documento', 'receptor.numDocumento', 'cliente.dte.nit',
-    'donante.nit', 'donatario.nit'
-  ];
-
-  for (var i = 0; i < pathsToSearch.length; i++) {
-    var keys = pathsToSearch[i].split('.');
-    var target = obj;
-
-    for (var k = 0; k < keys.length; k++) {
-      if (target && Object.prototype.hasOwnProperty.call(target, keys[k])) {
-        target = target[keys[k]];
-      } else {
-        target = null;
-        break;
-      }
-    }
-
-    if (target) {
-      var rawVal = (typeof target === 'object') 
-        ? (target.nit || target.doi || target.numDocumento || target.numeroDocumento || target.documento || '') 
-        : target;
-
-      var val = (rawVal || '').toString().trim();
-      if (val) return val.replace(/-/g, '');
+  for (var key in value) {
+    if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+    var child = value[key];
+    if (child && (typeof child === 'object' || typeof child === 'string')) {
+      var found = unwrapDte(child, depth + 1);
+      if (found) return found;
     }
   }
   return null;
 }
 
-function identifyCompany(jsonData) {
-  var emisor = getNit(jsonData, 'emisor');
-  var receptor = getNit(jsonData, 'receptor');
-  
-  for (var i = 0; i < COMPANIES.length; i++) {
-    var c = COMPANIES[i];
-    var nitList = Array.isArray(c.nit) ? c.nit : [c.nit];
-    
-    if (emisor && nitList.indexOf(emisor) !== -1) return { name: c.name, type: 'Ventas', label: c.name + (CONFIG.LABEL_VENTAS_SUFFIX || '-Ventas') };
-    if (receptor && nitList.indexOf(receptor) !== -1) return { name: c.name, type: 'Compras', label: c.name + (CONFIG.LABEL_COMPRAS_SUFFIX || '-Compras') };
+function isDteObject(obj) {
+  var ident = getKeyCI(obj, 'identificacion');
+  if (ident && typeof ident === 'object') return true;
+  var emisor = getKeyCI(obj, 'emisor') || getKeyCI(obj, 'donatario');
+  return !!(emisor && typeof emisor === 'object');
+}
+
+/** Lee una propiedad sin importar mayúsculas ni guiones bajos. */
+function getKeyCI(obj, key) {
+  if (!obj || typeof obj !== 'object') return undefined;
+  if (Object.prototype.hasOwnProperty.call(obj, key)) return obj[key];
+  var wanted = key.toLowerCase().replace(/_/g, '');
+  for (var k in obj) {
+    if (Object.prototype.hasOwnProperty.call(obj, k) && k.toLowerCase().replace(/_/g, '') === wanted) return obj[k];
   }
+  return undefined;
+}
+
+function getPathCI(obj, path) {
+  var keys = path.split('.');
+  var target = obj;
+  for (var i = 0; i < keys.length; i++) {
+    target = getKeyCI(target, keys[i]);
+    if (target === undefined || target === null) return undefined;
+  }
+  return target;
+}
+
+function findKeyDeep(obj, keyRegex, depth) {
+  depth = depth || 0;
+  if (!obj || typeof obj !== 'object' || depth > 3) return undefined;
+  for (var k in obj) {
+    if (!Object.prototype.hasOwnProperty.call(obj, k)) continue;
+    if (keyRegex.test(k) && obj[k] !== null && obj[k] !== '' && typeof obj[k] !== 'object') return obj[k];
+  }
+  for (var k2 in obj) {
+    if (!Object.prototype.hasOwnProperty.call(obj, k2)) continue;
+    var found = findKeyDeep(obj[k2], keyRegex, depth + 1);
+    if (found !== undefined) return found;
+  }
+  return undefined;
+}
+
+function getFechaEmision(dte) {
+  if (!dte) return '';
+  var paths = [
+    'identificacion.fecEmi', 'identificacion.fechaEmision', 'identificacion.fecha',
+    'fecEmi', 'fechaEmision', 'documento.fecEmi', 'identificacion.fecAnula'
+  ];
+  for (var i = 0; i < paths.length; i++) {
+    var d = parseEmissionDate(getPathCI(dte, paths[i]));
+    if (d) return formatYmd(d);
+  }
+  var deep = parseEmissionDate(findKeyDeep(dte, /^fec(ha)?_?emi(sion)?$/i));
+  return deep ? formatYmd(deep) : '';
+}
+
+function getCodigoGeneracion(json) {
+  if (!json) return '';
+  var c = getPathCI(json, 'identificacion.codigoGeneracion') || getKeyCI(json, 'codigoGeneracion') ||
+    findKeyDeep(json, /^codigo_?generacion$/i) || '';
+  c = c.toString().trim().toUpperCase();
+  if (!c || GENERIC_CODES.indexOf(c.toLowerCase()) !== -1) return '';
+  return c;
+}
+
+function getTipoDte(dte) {
+  var t = getPathCI(dte, 'identificacion.tipoDte') || getKeyCI(dte, 'tipoDte') || getPathCI(dte, 'documento.tipoDte') || '';
+  t = t.toString().trim();
+  return /^\d$/.test(t) ? '0' + t : t;
+}
+
+function getTipoNombre(tipoCodigo) {
+  return tipoCodigo ? tipoCodigo + ' - ' + (DTE_TYPE_NAMES[tipoCodigo] || 'Tipo desconocido') : '';
+}
+
+function getTipoDteNombre(dte, tipoCodigo) {
+  var name = getTipoNombre(tipoCodigo);
+  var documento = getKeyCI(dte, 'documento');
+  var esAnulacion = getKeyCI(dte, 'motivo') && documento && typeof documento === 'object';
+  return esAnulacion ? 'Anulación' + (name ? ' de ' + name : '') : name;
+}
+
+/** NIT/DUI como dígitos sin ceros iniciales; null si no lo parece. */
+function normalizeNit(value) {
+  if (value === null || value === undefined || typeof value === 'object') return null;
+  var digits = value.toString().replace(/\D/g, '');
+  if (digits.length < 8 || digits.length > 14) return null;
+  return digits.replace(/^0+/, '');
+}
+
+function extractNitValue(node, depth) {
+  depth = depth || 0;
+  if (node === null || node === undefined || depth > 3) return null;
+  if (typeof node !== 'object') return normalizeNit(node);
+
+  for (var i = 0; i < NIT_KEYS.length; i++) {
+    var v = getKeyCI(node, NIT_KEYS[i]);
+    if (v === undefined || v === null || v === '') continue;
+    var nit = extractNitValue(v, depth + 1);
+    if (nit) return nit;
+  }
+  return null;
+}
+
+function getPartyNit(jsonData, partyNames) {
+  if (!jsonData) return null;
+  for (var i = 0; i < partyNames.length; i++) {
+    var party = getKeyCI(jsonData, partyNames[i]);
+    if (!party || typeof party !== 'object') continue;
+    var nit = extractNitValue(party);
+    if (nit) return nit;
+  }
+  return null;
+}
+
+function getCompanyNits(company) {
+  var list = company.nits || company.nit || [];
+  return (Array.isArray(list) ? list : [list]).map(normalizeNit).filter(Boolean);
+}
+
+function makeClassification(company, type) {
+  var suffix = type === 'Ventas' ? CONFIG.LABEL_VENTAS_SUFFIX : CONFIG.LABEL_COMPRAS_SUFFIX;
+  return { name: company.name, type: type, label: company.name + suffix };
+}
+
+function noProcesadoClassification() {
   return { name: CONFIG.FOLDER_NO_PROCESADO, type: 'DTE', label: CONFIG.FOLDER_NO_PROCESADO };
 }
 
-function scanExternalLinks(message, threadData, errorLogSheet) {
-  var body = message.getBody();
-  var plainBody = message.getPlainBody();
-  var linkRegex = /href\s*=\s*["'](https?:\/\/[^"']+)["']|(https?:\/\/[^\s"'<>]+)/gi;
-  var match;
-  var links = [];
-  
-  while ((match = linkRegex.exec(body)) !== null) {
-    var url = match[1] || match[2];
-    url = url.replace(/[>\]\)\.,]+$/, '');
-    if (url.length > 15 && !links.includes(url) && 
-        !url.includes('google.com') && !url.includes('facebook.com') && 
-        !url.includes('twitter.com') && !url.includes('instagram.com') && !url.includes('schema.org') &&
-        !url.toLowerCase().endsWith('.png') && !url.toLowerCase().endsWith('.jpg') && !url.toLowerCase().endsWith('.gif')) {
-      links.push(url);
-    }
+function identifyCompany(jsonData, tipoCodigo) {
+  var inverted = CONFIG.INVERTED_DTE_TYPES.indexOf(tipoCodigo) !== -1;
+  var emisor = getPartyNit(jsonData, ['emisor', 'donatario']);
+  var receptor = getPartyNit(jsonData, ['receptor', 'cliente', 'sujetoExcluido', 'donante', 'documento']);
+
+  for (var i = 0; i < COMPANIES.length; i++) {
+    var nitList = getCompanyNits(COMPANIES[i]);
+    if (emisor && nitList.indexOf(emisor) !== -1) return makeClassification(COMPANIES[i], inverted ? 'Compras' : 'Ventas');
+    if (receptor && nitList.indexOf(receptor) !== -1) return makeClassification(COMPANIES[i], inverted ? 'Ventas' : 'Compras');
   }
-
-  var foundJson = null;
-  var foundAsset = null;
-  var jsonData = null;
-  var jsonUrlSource = '';
-
-  for (var url of links) {
-    try {
-      var res = UrlFetchApp.fetch(url, { muteHttpExceptions: true, timeoutSeconds: 25, followRedirects: true });
-      if (res.getResponseCode() === 200) {
-        var ct = (res.getHeaders()['Content-Type'] || '').toLowerCase();
-        var contentText = res.getContentText();
-        var blob = res.getBlob();
-
-        if (ct.includes('zip') || url.toLowerCase().includes('zip') || blob.getName().toLowerCase().endsWith('.zip')) {
-          try {
-            var extractedFiles = Utilities.unzip(blob);
-            for (var e = 0; e < extractedFiles.length; e++) {
-              var extName = extractedFiles[e].getName().toLowerCase();
-              if (extName.endsWith('.json')) {
-                var cleanContent = extractedFiles[e].getDataAsString('UTF-8').replace(/^\uFEFF/, '');
-                var parsed = parseJSONSafe(cleanContent, extName, errorLogSheet, threadData);
-                if (parsed) {
-                  jsonData = parsed;
-                  foundJson = extractedFiles[e];
-                  jsonUrlSource = url;
-                }
-              } else if (extName.endsWith('.pdf') || extName.endsWith('.xml')) {
-                foundAsset = extractedFiles[e];
-              }
-            }
-          } catch (zipErr) {}
-        } else if (!jsonData && (ct.includes('json') || contentText.trim().startsWith('{'))) {
-          var cleanContent = contentText.replace(/^\uFEFF/, '');
-          var parsed = parseJSONSafe(cleanContent, "url_externa_json", errorLogSheet, threadData);
-          if (parsed) {
-            jsonData = parsed;
-            foundJson = blob;
-            jsonUrlSource = url;
-          }
-        } else if (!foundAsset && ct.includes('pdf')) {
-          foundAsset = blob;
-        }
-      }
-    } catch (e) {}
-    if (jsonData && foundAsset) break;
-  }
-
-  if (jsonData) {
-    var classif = identifyCompany(jsonData);
-    var cod = (jsonData.identificacion && jsonData.identificacion.codigoGeneracion) ? jsonData.identificacion.codigoGeneracion : 'DTE_Externo';
-    var records = [];
-    
-    if (foundJson) {
-      foundJson.setName(cod + ".json");
-      records.push(createRecord(foundJson, threadData, 'json', classif.label, jsonData, jsonUrlSource));
-    }
-    
-    if (foundAsset) {
-      var ext = foundAsset.getName().split('.').pop().toLowerCase();
-      if (ext !== 'json') {
-        foundAsset.setName(cod + "." + ext);
-        records.push(createRecord(foundAsset, threadData, ext, classif.label, jsonData, jsonUrlSource));
-      }
-    } else {
-      records.push(buildMissingCounterpartRecord(threadData, classif.label, 'PDF', cod + ".json", jsonData, errorLogSheet, jsonUrlSource));
-    }
-    return { success: true, records: records, classification: classif };
-  }
-
-  return { success: false };
+  return noProcesadoClassification();
 }
 
+// ====================================================================================
+// === LECTURA DE PDF / XML SIN JSON ===
+// ====================================================================================
 
-function saveThreadData(configs, classif, records, threadData, monthNames, errorLogSheet) {
+function getAssetText(asset) {
+  if (asset.text !== undefined) return asset.text;
+  try {
+    asset.text = asset.fmt === 'pdf' ? extractPdfText(asset.blob) : readBlobText(asset.blob);
+  } catch (e) {
+    asset.text = '';
+  }
+  return asset.text;
+}
+
+var _ocrWarningShown = false;
+
+/** Texto de un PDF convirtiéndolo temporalmente a Google Docs (requiere Drive API). */
+function extractPdfText(blob) {
+  if (!CONFIG.ENABLE_PDF_OCR) return '';
+  if (typeof Drive === 'undefined') {
+    if (!_ocrWarningShown) {
+      Logger.log('>>> [OCR] Servicio avanzado "Drive API" no activado.');
+      _ocrWarningShown = true;
+    }
+    return '';
+  }
+
+  var tempId = null;
+  try {
+    var media = (blob.copyBlob ? blob.copyBlob() : blob).setContentType('application/pdf');
+    var docType = 'application/vnd.google-apps.document';
+    if (typeof Drive.Files.create === 'function') {
+      tempId = Drive.Files.create({ name: 'tmp_ocr_dte', mimeType: docType }, media, { ocrLanguage: 'es' }).id;
+    } else {
+      tempId = Drive.Files.insert({ title: 'tmp_ocr_dte', mimeType: docType }, media, { ocr: true, ocrLanguage: 'es' }).id;
+    }
+    return DocumentApp.openById(tempId).getBody().getText();
+  } catch (e) {
+    Logger.log('>>> [OCR] No se pudo leer el PDF: ' + e.toString());
+    return '';
+  } finally {
+    if (tempId) {
+      try { DriveApp.getFileById(tempId).setTrashed(true); } catch (trashErr) {}
+    }
+  }
+}
+
+/** Códigos de Generación, fecha de emisión, tipo y NITs (en orden de aparición) de un texto. */
+function extractInfoFromText(text) {
+  var info = { codigos: [], fecha: '', nits: [], tipoCodigo: '' };
+  if (!text) return info;
+
+  var tipoMatch = text.match(/DTE-(\d{2})-[A-Z0-9]{8}-\d{15}/i);
+  if (tipoMatch) info.tipoCodigo = tipoMatch[1];
+
+  var m;
+  var guidRe = new RegExp(GUID_REGEX.source, 'gi');
+  while ((m = guidRe.exec(text)) !== null) {
+    var c = m[0].toUpperCase();
+    if (info.codigos.indexOf(c) === -1) info.codigos.push(c);
+  }
+
+  var datePatterns = [
+    /<fecEmi>\s*([^<]+)</i,
+    /"fecEmi"\s*:\s*"([^"]+)"/i,
+    /(\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[\/-]\d{1,2}[\/-]\d{4})[^0-9]{0,40}hora\s*(?:de\s*)?emisi[oó]n/i,
+    /fecha\s*(?:y\s*hora\s*)?(?:de\s*)?emisi[oó]n[^0-9]{0,80}(\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[\/-]\d{1,2}[\/-]\d{4})/i,
+    /(\d{4}-\d{2}-\d{2}|\d{1,2}\/\d{1,2}\/\d{4})/
+  ];
+  for (var i = 0; i < datePatterns.length; i++) {
+    var dm = text.match(datePatterns[i]);
+    var d = dm ? parseEmissionDate(dm[1]) : null;
+    if (d) {
+      info.fecha = formatYmd(d);
+      break;
+    }
+  }
+
+  var nitRe = /\b\d{4}-\d{6}-\d{3}-\d\b|\b\d{14}\b|\b\d{8}-\d\b/g;
+  while ((m = nitRe.exec(text)) !== null) {
+    var nit = normalizeNit(m[0]);
+    if (nit && info.nits.indexOf(nit) === -1) info.nits.push(nit);
+  }
+  return info;
+}
+
+/** El emisor aparece antes que el receptor: si el NIT de la empresa es el primero, es Venta. */
+function identifyCompanyFromNits(nits) {
+  if (!nits || nits.length === 0) return null;
+  var best = null;
+  COMPANIES.forEach(function(c) {
+    getCompanyNits(c).forEach(function(n) {
+      var idx = nits.indexOf(n);
+      if (idx !== -1 && (!best || idx < best.idx)) best = { idx: idx, company: c };
+    });
+  });
+  if (!best) return null;
+  return makeClassification(best.company, best.idx === 0 ? 'Ventas' : 'Compras');
+}
+
+/** Datos de un DTE en XML (mismos campos que el JSON del Ministerio de Hacienda). */
+function buildXmlDteMeta(text, fileName) {
+  if (!text) return null;
+
+  function block(tag) {
+    var m = text.match(new RegExp('<(?:\\w+:)?' + tag + '\\b[^>]*>([\\s\\S]*?)<\\/(?:\\w+:)?' + tag + '>', 'i'));
+    return m ? m[1] : '';
+  }
+  function value(source, tags) {
+    for (var i = 0; i < tags.length; i++) {
+      var m = source.match(new RegExp('<(?:\\w+:)?' + tags[i] + '\\b[^>]*>\\s*([^<]+?)\\s*<', 'i'));
+      if (m) return m[1];
+    }
+    return '';
+  }
+
+  var idBlock = block('identificacion') || text;
+  var nitTags = ['nit', 'numDocumento', 'numeroDocumento', 'doi', 'documento'];
+  var dte = {
+    identificacion: {
+      codigoGeneracion: value(idBlock, ['codigoGeneracion']),
+      fecEmi: value(idBlock, ['fecEmi', 'fechaEmision']),
+      tipoDte: value(idBlock, ['tipoDte'])
+    },
+    emisor: { nit: value(block('emisor') || block('donatario'), nitTags) },
+    receptor: { nit: value(block('receptor') || block('cliente') || block('sujetoExcluido') || block('donante'), nitTags) }
+  };
+  if (!dte.emisor.nit && !dte.identificacion.codigoGeneracion) return null;
+  return buildDteMeta(dte, fileName);
+}
+
+function buildOrphanRecords(asset, threadData, ctx, hasHints, fallbackClassif) {
+  var wantText = asset.fmt === 'xml' || hasHints || looksLikeDteName(asset.name);
+  var text = wantText ? getAssetText(asset) : '';
+  var info = extractInfoFromText(text);
+  var xmlMeta = asset.fmt === 'xml' ? buildXmlDteMeta(text, asset.name) : null;
+  var codigo = (xmlMeta && xmlMeta.codigo) || extractGuidFromName(asset.name) || info.codigos[0] || '';
+  if (ORPHAN_REQUIRE_DTE_NAME && !codigo) return [];
+
+  // Si el JSON (o XML) de este código ya se leyó, se heredan sus datos.
+  var known = codigo ? lookupCodeMeta(ctx, codigo) : null;
+  var xmlClassif = xmlMeta && xmlMeta.classif.type !== 'DTE' ? xmlMeta.classif : null;
+  var meta = {
+    codigo: codigo,
+    fecha: (known && known.fecha) || (xmlMeta && xmlMeta.fecha) || info.fecha || '',
+    tipoNombre: (known && known.tipoNombre) || (xmlMeta && xmlMeta.tipoNombre) || getTipoNombre(info.tipoCodigo),
+    classif: (known && known.classif) || xmlClassif || identifyCompanyFromNits(info.nits) || fallbackClassif || noProcesadoClassification()
+  };
+  if (xmlMeta) rememberCodeMeta(ctx, meta);
+
+  return [
+    createRecord(asset, threadData, meta, asset.url),
+    buildMissingCounterpartRecord(threadData, meta, 'JSON', asset.name, '')
+  ];
+}
+
+/** Clasificación común si todos los JSON del mensaje coinciden; si no, null. */
+function getUniqueCompanyClassification(docs) {
+  var labels = {};
+  docs.forEach(function(d) { if (d.meta.classif.type !== 'DTE') labels[d.meta.classif.label] = d.meta.classif; });
+  var keys = Object.keys(labels);
+  return keys.length === 1 ? labels[keys[0]] : null;
+}
+
+// ====================================================================================
+// === ENLACES EXTERNOS ===
+// ====================================================================================
+
+function messageHasDteHints(message, assets) {
+  if (assets.some(function(a) { return a.fmt === 'json' || looksLikeDteName(a.name); })) return true;
+  var text = (message.getSubject() + ' ' + message.getPlainBody()).toLowerCase();
+  if (GUID_REGEX.test(text)) return true;
+  return CONFIG.DTE_KEYWORDS.some(function(k) { return text.indexOf(k) !== -1; });
+}
+
+function isIgnoredLink(url) {
+  if (IGNORED_LINK_PATTERN.test(url)) return true;
+  var hostMatch = url.match(/^https?:\/\/([^\/?#:]+)/i);
+  var host = hostMatch ? hostMatch[1].toLowerCase() : '';
+  return IGNORED_LINK_DOMAINS.some(function(d) { return host === d || host.endsWith('.' + d); });
+}
+
+function extractCandidateLinks(message) {
+  var sources = [message.getBody() || '', message.getPlainBody() || ''];
+  var linkRegex = /href\s*=\s*["'](https?:\/\/[^"']+)["']|(https?:\/\/[^\s"'<>]+)/gi;
+  var links = [];
+
+  sources.forEach(function(src) {
+    var match;
+    linkRegex.lastIndex = 0;
+    while ((match = linkRegex.exec(src)) !== null) {
+      var url = (match[1] || match[2]).replace(/&amp;/g, '&').replace(/[>\]\)\.,;]+$/, '');
+      if (url.length > 15 && links.indexOf(url) === -1 && !isIgnoredLink(url)) links.push(url);
+    }
+  });
+
+  links.sort(function(a, b) { return (PREFERRED_LINK_PATTERN.test(b) ? 1 : 0) - (PREFERRED_LINK_PATTERN.test(a) ? 1 : 0); });
+  return links.slice(0, CONFIG.MAX_LINKS_PER_MESSAGE || 6);
+}
+
+function fetchUrlCached(url, cache) {
+  if (Object.prototype.hasOwnProperty.call(cache, url)) return cache[url];
+  var out;
+  try {
+    var res = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true });
+    var headers = res.getHeaders();
+    out = {
+      code: res.getResponseCode(),
+      contentType: (headers['Content-Type'] || headers['content-type'] || '').toLowerCase(),
+      blob: res.getBlob(),
+      error: ''
+    };
+  } catch (e) {
+    out = { code: 0, contentType: '', blob: null, error: e.toString() };
+  }
+  cache[url] = out;
+  return out;
+}
+
+function blobStartsWith(blob, signature) {
+  try {
+    var bytes = blob.getBytes();
+    for (var i = 0; i < signature.length; i++) {
+      if (bytes[i] !== signature[i]) return false;
+    }
+    return bytes.length >= signature.length;
+  } catch (e) {
+    return false;
+  }
+}
+
+function isZipBlob(blob) { return blobStartsWith(blob, [0x50, 0x4B]); }
+function isPdfBlob(blob) { return blobStartsWith(blob, [0x25, 0x50, 0x44, 0x46]); }
+
+/** Busca en los enlaces del correo un JSON de DTE y su PDF/XML. Devuelve { dte, jsonBlob, asset, url } o null. */
+function scanExternalLinks(message, threadData, errorLogSheet, fetchCache) {
+  var links = extractCandidateLinks(message);
+  var found = { dte: null, jsonBlob: null, asset: null, url: '' };
+
+  for (var i = 0; i < links.length; i++) {
+    var url = links[i];
+    var res = fetchUrlCached(url, fetchCache);
+    if (res.code !== 200 || !res.blob) continue;
+    var blob = res.blob;
+
+    if (res.contentType.indexOf('zip') !== -1 || isZipBlob(blob)) {
+      var files;
+      try {
+        files = Utilities.unzip(blob);
+      } catch (zipErr) {
+        logToErrorSheet(errorLogSheet, "Error ZIP externo", url, threadData, zipErr.toString());
+        continue;
+      }
+      files.forEach(function(f) {
+        var n = f.getName().toLowerCase();
+        if (!found.dte && n.endsWith('.json')) {
+          var d = unwrapDte(parseJSONSafe(f.getDataAsString('UTF-8')));
+          if (d) {
+            found.dte = d;
+            found.jsonBlob = f;
+            found.url = url;
+          }
+        } else if (!found.asset && (n.endsWith('.pdf') || n.endsWith('.xml'))) {
+          found.asset = { blob: f, fmt: getExt(n), url: url };
+        }
+      });
+    } else if (res.contentType.indexOf('pdf') !== -1 || isPdfBlob(blob)) {
+      if (!found.asset) found.asset = { blob: blob, fmt: 'pdf', url: url };
+    } else if (!found.dte && (res.contentType.indexOf('json') !== -1 || res.contentType.indexOf('text') !== -1 || !res.contentType)) {
+      var text = '';
+      try { text = blob.getDataAsString('UTF-8').trim(); } catch (txtErr) {}
+      if (text.charAt(0) === '{' || text.charAt(0) === '[') {
+        var dte = unwrapDte(parseJSONSafe(text));
+        if (dte) {
+          found.dte = dte;
+          found.jsonBlob = blob;
+          found.url = url;
+        }
+      }
+    }
+    if (found.dte && found.asset) break;
+  }
+
+  return (found.dte || found.asset) ? found : null;
+}
+
+/** Busca el PDF de un JSON en los enlaces del correo. Devuelve { blob, url }, { detail } o null. */
+function attemptDownloadExternalFile(message, baseFileName, fetchCache) {
+  var links = extractCandidateLinks(message);
+  if (links.length === 0) return null;
+
+  var attempts = [];
+  for (var i = 0; i < links.length; i++) {
+    var url = links[i];
+    var res = fetchUrlCached(url, fetchCache);
+    if (res.code !== 200 || !res.blob) {
+      attempts.push((res.error ? 'Error' : 'HTTP ' + res.code) + ': ' + url);
+      continue;
+    }
+
+    if (res.contentType.indexOf('pdf') !== -1 || isPdfBlob(res.blob)) {
+      res.blob.setName(baseFileName + '.pdf');
+      return { blob: res.blob, url: url };
+    }
+
+    if (res.contentType.indexOf('zip') !== -1 || isZipBlob(res.blob)) {
+      try {
+        var pdf = Utilities.unzip(res.blob).find(function(f) { return f.getName().toLowerCase().endsWith('.pdf'); });
+        if (pdf) {
+          pdf.setName(baseFileName + '.pdf');
+          return { blob: pdf, url: url };
+        }
+      } catch (zipErr) {}
+    }
+    attempts.push('Sin PDF: ' + url);
+  }
+  return { detail: 'Enlaces revisados -> ' + attempts.join(' | ') };
+}
+
+// ====================================================================================
+// === REGISTROS Y GUARDADO ===
+// ====================================================================================
+
+function createRecord(asset, t, meta, extUrl) {
+  var classif = meta.classif || noProcesadoClassification();
+  return {
+    attachment: asset.blob, from: t.from, subject: t.subject, fileName: asset.name, emailDate: t.date,
+    fileFormat: asset.fmt, threadPermalink: t.permalink, externalUrl: extUrl || '',
+    fechaEmision: meta.fecha || '',
+    codigo: meta.codigo || extractGuidFromName(asset.name),
+    companyName: classif.name, classType: classif.type, typeLabel: classif.label,
+    tipoDoc: meta.tipoNombre || ''
+  };
+}
+
+function buildMissingCounterpartRecord(t, meta, missingFormat, receivedFileName, detail) {
+  var fmt = missingFormat.toUpperCase();
+  var received = cleanFileName(receivedFileName);
+  var classif = meta.classif || noProcesadoClassification();
+  var missingText = fmt === 'PDF' ? CONFIG.LABEL_PDF_MISSING : CONFIG.LABEL_JSON_MISSING;
+
+  return {
+    attachment: null,
+    from: t.from,
+    subject: t.subject,
+    fileName: missingText + ' (contraparte de: ' + received + ')',
+    emailDate: t.date,
+    fileFormat: fmt.toLowerCase(),
+    threadPermalink: t.permalink,
+    externalUrl: '',
+    fechaEmision: meta.fecha || '',
+    codigo: meta.codigo || extractGuidFromName(receivedFileName),
+    companyName: classif.name, classType: classif.type, typeLabel: classif.label,
+    tipoDoc: meta.tipoNombre || '',
+    isMissing: true,
+    counterpartOf: received,
+    missingDetail: detail || ''
+  };
+}
+
+function findConfig(configs, name) {
+  return configs.find(function(c) { return c.name === name; }) ||
+    configs.find(function(c) { return c.name === CONFIG.FOLDER_NO_PROCESADO; }) ||
+    configs[0];
+}
+
+function saveThreadData(ctx, records, threadData) {
   var result = { saved: 0, duplicates: 0 };
-  if (!records || records.length === 0) return result;
-
   var scriptTimeZone = Session.getScriptTimeZone();
+  var monthNames = CONFIG.MONTH_NAMES;
   var folderCache = {};
 
   records.forEach(function(r) {
-    var companyName = r.companyName || classif.name;
-    var config = configs.find(c => c.name === companyName) || configs[0];
-
+    var config = findConfig(ctx.configs, r.companyName);
     if (!config) return;
 
-   
-    var recordDate = r.emailDate ? new Date(r.emailDate) : threadData.date;
-    var localDate = new Date(Utilities.formatDate(recordDate, scriptTimeZone, "yyyy-MM-dd HH:mm:ss"));
-    var year = localDate.getFullYear(); // AÑO REAL (2025, 2026, etc.)
-    var monthName = monthNames[localDate.getMonth()];
-    var monthNum = (localDate.getMonth() + 1).toString().padStart(2, '0');
+    var folderDate = parseEmissionDate(r.fechaEmision);
+    if (!folderDate) {
+      var fallbackDate = r.emailDate ? new Date(r.emailDate) : threadData.date;
+      folderDate = parseEmissionDate(Utilities.formatDate(fallbackDate, scriptTimeZone, "yyyy-MM-dd"));
+    }
+    var year = folderDate.getFullYear();
+    var monthName = monthNames[folderDate.getMonth()];
+    var monthNum = (folderDate.getMonth() + 1).toString().padStart(2, '0');
 
     var dedupKey = buildDedupKey(r);
-    var dedupIndex = dedupKey ? getDedupeIndex(config) : null;
+    var dedupIndex = getDedupeIndex(config);
     var missingKey = dedupKey + '|FALTANTE';
     if (dedupKey) {
-      var isDuplicate = r.isMissing ? (dedupIndex[dedupKey] || dedupIndex[missingKey]) : dedupIndex[dedupKey];
+      var isDuplicate = r.isMissing ? (isAlreadyRegistered(ctx, r.codigo, r.fileFormat) || dedupIndex[missingKey]) : dedupIndex[dedupKey];
       if (isDuplicate) {
         result.duplicates++;
         return;
       }
     }
 
-    var fullTypeLabel = r.type || classif.label || '';
-    var folderType = 'DTE';
-    var comprasSuffix = CONFIG.LABEL_COMPRAS_SUFFIX || '-Compras';
-    var ventasSuffix = CONFIG.LABEL_VENTAS_SUFFIX || '-Ventas';
-
-    if (fullTypeLabel.indexOf(ventasSuffix) !== -1) {
-      folderType = 'Ventas - ' + config.name;
-    } else if (fullTypeLabel.indexOf(comprasSuffix) !== -1) {
-      folderType = 'Compras - ' + config.name;
-    } else {
-      folderType = CONFIG.FOLDER_NO_PROCESADO;
-    }
-
+    var isCompany = config.name !== CONFIG.FOLDER_NO_PROCESADO;
+    var folderType = CONFIG.FOLDER_NO_PROCESADO;
+    if (isCompany && r.classType === 'Ventas') folderType = 'Ventas - ' + config.name;
+    if (isCompany && r.classType === 'Compras') folderType = 'Compras - ' + config.name;
 
     var cacheKey = config.name + '_' + year + '_' + monthNum + '_' + folderType;
-    var targetFolder;
-
-    if (folderCache[cacheKey]) {
-      targetFolder = folderCache[cacheKey];
-    } else {
-      var yearDir = year + ' - ' + config.name; // Ej: "2025 - ATS Group"
-      var monthDir = monthNum + '-' + monthName + '-' + year + ' - ' + config.name;
-
-      var yearFolder = getOrCreateFolder(config.folder, yearDir);
-      var monthFolder = getOrCreateFolder(yearFolder, monthDir);
-
-      targetFolder = (folderType === CONFIG.FOLDER_NO_PROCESADO) 
-        ? monthFolder 
-        : getOrCreateFolder(monthFolder, folderType);
-
+    var targetFolder = folderCache[cacheKey];
+    if (!targetFolder) {
+      var yearFolder = getOrCreateFolder(config.folder, year + ' - ' + config.name);
+      var monthFolder = getOrCreateFolder(yearFolder, monthNum + '-' + monthName + '-' + year + ' - ' + config.name);
+      targetFolder = (folderType === CONFIG.FOLDER_NO_PROCESADO) ? monthFolder : getOrCreateFolder(monthFolder, folderType);
       folderCache[cacheKey] = targetFolder;
     }
 
-    var driveUrl = "NO GUARDADO";
+    var driveUrl = '';
+    var createdFile = null;
     if (r.attachment) {
       try {
-        var file = targetFolder.createFile(r.attachment);
-        driveUrl = '=HYPERLINK("' + file.getUrl() + '", "Ver Archivo")';
+        createdFile = targetFolder.createFile(r.attachment);
+        driveUrl = '=HYPERLINK("' + createdFile.getUrl() + '", "Ver Archivo")';
       } catch (e) {
         driveUrl = "ERROR DRIVE";
+        logToErrorSheet(ctx.errorLogSheet, 'Error Drive', r.fileName, r, e.toString());
       }
-    } else if (r.externalUrl) {
-      driveUrl = r.externalUrl;
     }
 
     var row = [
-      fullTypeLabel, 
-      r.from || threadData.from, 
-      r.subject || threadData.subject, 
-      r.emailDate || localDate, 
-      monthName, 
+      r.typeLabel || '',
+      r.from || threadData.from,
+      r.subject || threadData.subject,
+      r.emailDate || folderDate,
+      monthName,
       year,
-      r.fileName, 
-      r.fileFormat, 
-      driveUrl, 
-      targetFolder.getName(), 
+      r.fileName,
+      r.fileFormat,
+      driveUrl,
+      targetFolder.getName(),
       r.fechaEmision || '',
-      '=HYPERLINK("' + threadData.permalink + '", "Ver correo")', 
-      new Date(), 
+      '=HYPERLINK("' + threadData.permalink + '", "Ver correo")',
+      new Date(),
       r.externalUrl || '',
-      r.codigo || ''
+      r.codigo || '',
+      r.tipoDoc || ''
     ];
 
-   
-    var written = writeDataToSheetImmediately(config.sheet, [row], config.sheetName);
-
-    if (written) {
-      result.saved++;
-      if (dedupKey && driveUrl !== "ERROR DRIVE") {
-        dedupIndex[r.isMissing ? missingKey : dedupKey] = true;
+    if (!writeDataToSheetImmediately(config.sheet, [row])) {
+      if (createdFile) {
+        try { createdFile.setTrashed(true); } catch (trashErr) {}
       }
+      logToErrorSheet(ctx.errorLogSheet, 'Error escritura hoja', r.fileName, r, 'No se pudo escribir en ' + config.sheetName);
+      return;
+    }
+
+    result.saved++;
+    if (dedupKey && driveUrl !== "ERROR DRIVE") {
+      dedupIndex[r.isMissing ? missingKey : dedupKey] = true;
+    }
+
+    if (r.isMissing) {
+      logToErrorSheet(ctx.errorLogSheet, 'Falta contraparte ' + r.fileFormat.toUpperCase(), r.counterpartOf, r,
+        'Se recibió "' + r.counterpartOf + '" pero no su ' + r.fileFormat.toUpperCase() +
+        (r.codigo ? ' (Código: ' + r.codigo + ')' : '') + (r.missingDetail ? '. ' + r.missingDetail : ''));
+    } else if (r.codigo && r.fileFormat === 'json' && !config.codeMeta[r.codigo]) {
+      config.codeMeta[r.codigo] = { classif: { name: r.companyName, type: r.classType, label: r.typeLabel }, fecha: r.fechaEmision, tipoNombre: r.tipoDoc };
     }
   });
 
   return result;
 }
 
-function getCodigoGeneracion(json) {
-  if (!json) return '';
-  var c = (json.identificacion && json.identificacion.codigoGeneracion)
-    ? json.identificacion.codigoGeneracion
-    : (json.codigoGeneracion || '');
-  c = c.toString().trim().toUpperCase();
-  if (!c || GENERIC_CODES.indexOf(c.toLowerCase()) !== -1) return '';
-  return c;
+function parseEmissionDate(value) {
+  if (value === null || value === undefined || value === '') return null;
+
+  if (Object.prototype.toString.call(value) === '[object Date]') {
+    return isNaN(value.getTime()) ? null : new Date(value.getFullYear(), value.getMonth(), value.getDate());
+  }
+
+  if (typeof value === 'number') {
+    var fromNumber = new Date(value);
+    return isNaN(fromNumber.getTime()) ? null : new Date(fromNumber.getFullYear(), fromNumber.getMonth(), fromNumber.getDate());
+  }
+
+  var text = value.toString().trim();
+  var iso = text.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/);
+  if (iso) return new Date(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3]));
+
+  var dmy = text.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})/);
+  if (dmy) return new Date(Number(dmy[3]), Number(dmy[2]) - 1, Number(dmy[1]));
+
+  var parsed = new Date(text);
+  return isNaN(parsed.getTime()) ? null : new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate());
+}
+
+function formatYmd(date) {
+  if (!date) return '';
+  return date.getFullYear() + '-' + ('0' + (date.getMonth() + 1)).slice(-2) + '-' + ('0' + date.getDate()).slice(-2);
 }
 
 function extractGuidFromName(name) {
@@ -613,10 +1115,15 @@ function buildDedupKey(r) {
   return r.codigo + '|' + (r.fileFormat || '').toString().toLowerCase();
 }
 
+/**
+ * Lee una vez por ejecución la hoja de una empresa:
+ *  dedupeIndex: "CODIGO|formato" ya registrados; codeMeta: datos del JSON de cada código.
+ */
 function getDedupeIndex(config) {
   if (config.dedupeIndex) return config.dedupeIndex;
 
   var index = {};
+  var codeMeta = {};
   var sheet = config.sheet;
   var lastRow = sheet.getLastRow();
 
@@ -625,23 +1132,62 @@ function getDedupeIndex(config) {
     var values = sheet.getRange(2, 1, lastRow - 1, numCols).getValues();
 
     values.forEach(function(row) {
-      var fileName = (row[6] || '').toString();          
-      var fmt = (row[7] || '').toString().toLowerCase();      
-      var driveUrl = (row[8] || '').toString();                
-      var codigoCol = (row[14] || '').toString().trim().toUpperCase(); 
+      var label = (row[0] || '').toString();
+      var fileName = (row[6] || '').toString();
+      var fmt = (row[7] || '').toString().toLowerCase();
+      var driveUrl = (row[8] || '').toString();
+      var codigoCol = (row[14] || '').toString().trim().toUpperCase();
       var isMissing = /no encontrado/i.test(fileName);
 
-      if (driveUrl === 'ERROR DRIVE') return; 
+      if (driveUrl === 'ERROR DRIVE') return;
 
       var codigo = codigoCol || (isMissing ? '' : extractGuidFromName(fileName));
       if (!codigo || !fmt) return;
 
       index[codigo + '|' + fmt + (isMissing ? '|FALTANTE' : '')] = true;
+
+      if (!isMissing && fmt === 'json' && !codeMeta[codigo]) {
+        codeMeta[codigo] = {
+          classif: classificationFromLabel(config.name, label),
+          fecha: formatYmd(parseEmissionDate(row[10])),
+          tipoNombre: (row[15] || '').toString()
+        };
+      }
     });
   }
 
   config.dedupeIndex = index;
+  config.codeMeta = codeMeta;
   return index;
+}
+
+function classificationFromLabel(companyName, label) {
+  if (companyName === CONFIG.FOLDER_NO_PROCESADO) return noProcesadoClassification();
+  var company = COMPANIES.find(function(c) { return c.name === companyName; }) || { name: companyName };
+  if (label.endsWith(CONFIG.LABEL_VENTAS_SUFFIX)) return makeClassification(company, 'Ventas');
+  if (label.endsWith(CONFIG.LABEL_COMPRAS_SUFFIX)) return makeClassification(company, 'Compras');
+  return noProcesadoClassification();
+}
+
+function rememberCodeMeta(ctx, meta) {
+  if (meta.codigo && meta.classif.type !== 'DTE') {
+    ctx.threadCodeMeta[meta.codigo] = { classif: meta.classif, fecha: meta.fecha, tipoNombre: meta.tipoNombre };
+  }
+}
+
+function lookupCodeMeta(ctx, codigo) {
+  if (ctx.threadCodeMeta[codigo]) return ctx.threadCodeMeta[codigo];
+  for (var i = 0; i < ctx.configs.length; i++) {
+    getDedupeIndex(ctx.configs[i]);
+    if (ctx.configs[i].codeMeta[codigo]) return ctx.configs[i].codeMeta[codigo];
+  }
+  return null;
+}
+
+function isAlreadyRegistered(ctx, codigo, fmt) {
+  if (!codigo) return false;
+  var key = codigo + '|' + fmt.toLowerCase();
+  return ctx.configs.some(function(c) { return !!getDedupeIndex(c)[key]; });
 }
 
 function getOrCreateFolder(parent, name) {
@@ -650,17 +1196,12 @@ function getOrCreateFolder(parent, name) {
 }
 
 function getOrCreateRootFolder() {
-  var rootFolder;
   if (CONFIG.DTE_ROOT_FOLDER_ID && CONFIG.DTE_ROOT_FOLDER_ID.trim() !== '') {
     try {
-      rootFolder = DriveApp.getFolderById(CONFIG.DTE_ROOT_FOLDER_ID);
-      if (rootFolder.isTrashed()) {
-        throw new Error("La carpeta configurada está en la papelera.");
-      }
-      return rootFolder;
-    } catch (e) {
-      Logger.log('⚠️ ID inaccesible o en papelera. Buscando por nombre...');
-    }
+      var rootFolder = DriveApp.getFolderById(CONFIG.DTE_ROOT_FOLDER_ID);
+      if (!rootFolder.isTrashed()) return rootFolder;
+    } catch (e) {}
+    Logger.log('⚠️ ID de carpeta inaccesible o en papelera. Buscando por nombre...');
   }
 
   var existingFolders = DriveApp.getFoldersByName(CONFIG.DTE_ROOT_FOLDER_NAME);
@@ -668,18 +1209,19 @@ function getOrCreateRootFolder() {
     var folder = existingFolders.next();
     if (!folder.isTrashed()) return folder;
   }
-
   return DriveApp.createFolder(CONFIG.DTE_ROOT_FOLDER_NAME);
 }
 
-function getExt(name) { return name.split('.').pop().toLowerCase(); }
+function getExt(name) { return (name || '').split('.').pop().toLowerCase(); }
+function baseName(name) { var n = cleanFileName(name); var dot = n.lastIndexOf('.'); return dot > 0 ? n.substring(0, dot) : n; }
 function cleanFileName(name) { return (name || '').toString().split(/[\\\/]/).pop(); }
 function looksLikeDteName(name) { return GUID_REGEX.test(name || ''); }
 
-function parseJSONSafe(content, name, errorLogSheet, threadData) {
+/** JSON.parse tolerante: quita caracteres de control y recorta basura al final. */
+function parseJSONSafe(content) {
   if (!content) return null;
-  content = content.replace(/^\uFEFF/, '').trim();
-  var cleanContent = content.replace(/\t/g, " ").replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F]/g, "");
+  var cleanContent = content.replace(/^﻿/, '').trim()
+    .replace(/\t/g, " ").replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F]/g, "");
   try {
     return JSON.parse(cleanContent);
   } catch (e) {
@@ -695,19 +1237,9 @@ function parseJSONSafe(content, name, errorLogSheet, threadData) {
   return null;
 }
 
-function createRecord(blob, t, format, type, json, extUrl) {
-  return {
-    attachment: blob, from: t.from, subject: t.subject, fileName: blob.getName(), emailDate: t.date,
-    fileFormat: format, type: type, threadPermalink: t.permalink, externalUrl: extUrl || '',
-    fechaEmision: (json && json.identificacion) ? json.identificacion.fecEmi : '',
-    codigo: getCodigoGeneracion(json) || extractGuidFromName(blob.getName())
-  };
-}
-
-function writeDataToSheetImmediately(sheet, rows, name) {
-  var maxRetries = 3;
+function writeDataToSheetImmediately(sheet, rows) {
   var retryDelay = 1000;
-  for (var attempt = 1; attempt <= maxRetries; attempt++) {
+  for (var attempt = 1; attempt <= 3; attempt++) {
     try {
       var last = sheet.getLastRow();
       if (last + rows.length > sheet.getMaxRows()) sheet.insertRowsAfter(sheet.getMaxRows(), rows.length);
@@ -715,7 +1247,7 @@ function writeDataToSheetImmediately(sheet, rows, name) {
       SpreadsheetApp.flush();
       return true;
     } catch (e) {
-      if (attempt < maxRetries) {
+      if (attempt < 3) {
         Utilities.sleep(retryDelay);
         retryDelay *= 2;
       }
@@ -724,30 +1256,121 @@ function writeDataToSheetImmediately(sheet, rows, name) {
   return false;
 }
 
+// ====================================================================================
+// === ETIQUETAS DE GMAIL ===
+// ====================================================================================
 
-function setupLabels() {
-  var labels = {};
-  COMPANIES.forEach(c => {
-    var labelCompras = c.name + (CONFIG.LABEL_COMPRAS_SUFFIX || '-Compras');
-    var labelVentas = c.name + (CONFIG.LABEL_VENTAS_SUFFIX || '-Ventas');
-
-    labels[labelCompras] = GmailApp.getUserLabelByName(labelCompras) || GmailApp.createLabel(labelCompras);
-    labels[labelVentas] = GmailApp.getUserLabelByName(labelVentas) || GmailApp.createLabel(labelVentas);
+function getClassificationLabelNames() {
+  var names = [];
+  COMPANIES.forEach(function(c) {
+    names.push(c.name + CONFIG.LABEL_COMPRAS_SUFFIX);
+    names.push(c.name + CONFIG.LABEL_VENTAS_SUFFIX);
   });
+  names.push(CONFIG.FOLDER_NO_PROCESADO);
+  names.push(CONFIG.LABEL_OTROS);
+  return names;
+}
 
-  labels[CONFIG.FOLDER_NO_PROCESADO] = GmailApp.getUserLabelByName(CONFIG.FOLDER_NO_PROCESADO) || GmailApp.createLabel(CONFIG.FOLDER_NO_PROCESADO);
-  labels[CONFIG.LABEL_OTROS] = GmailApp.getUserLabelByName(CONFIG.LABEL_OTROS) || GmailApp.createLabel(CONFIG.LABEL_OTROS);
-  
-  if (CONFIG.PROCESSED_LABEL_NAME) {
-    labels[CONFIG.PROCESSED_LABEL_NAME] = GmailApp.getUserLabelByName(CONFIG.PROCESSED_LABEL_NAME) || GmailApp.createLabel(CONFIG.PROCESSED_LABEL_NAME);
+function getLabelPath(shortName) {
+  return CONFIG.LABEL_PARENT ? CONFIG.LABEL_PARENT + '/' + shortName : shortName;
+}
+
+/** Forma de búsqueda de Gmail: "DTE/No procesado" -> "dte-no-procesado". */
+function toGmailSearchLabel(path) {
+  return path.toLowerCase().replace(/[\s\/]+/g, '-');
+}
+
+function buildGmailSearchQuery() {
+  var parts = [];
+  if (CONFIG.GMAIL_SEARCH_SCOPE) parts.push(CONFIG.GMAIL_SEARCH_SCOPE);
+  if (CONFIG.GMAIL_SEARCH_AFTER) parts.push('after:' + CONFIG.GMAIL_SEARCH_AFTER);
+  getClassificationLabelNames().forEach(function(name) {
+    parts.push('-label:' + toGmailSearchLabel(getLabelPath(name)));
+  });
+  return parts.join(' ');
+}
+
+function threadHasOwnLabel(thread, allLabels) {
+  var ownPaths = Object.keys(allLabels).map(function(n) { return getLabelPath(n).toLowerCase(); });
+  return thread.getLabels().some(function(l) { return ownPaths.indexOf(l.getName().toLowerCase()) !== -1; });
+}
+
+/**
+ * Etiqueta única del hilo. No procesado si algún documento no se asignó a una empresa (para
+ * revisión manual); si no, la empresa/tipo con más archivos (en empate, el primero). Otros si no hay DTE.
+ */
+function resolveThreadLabel(records) {
+  if (records.length === 0) return CONFIG.LABEL_OTROS;
+  if (records.some(function(r) { return r.classType === 'DTE'; })) return CONFIG.FOLDER_NO_PROCESADO;
+  var counts = {};
+  var order = [];
+  records.forEach(function(r) {
+    if (r.isMissing) return;
+    if (!counts[r.typeLabel]) {
+      counts[r.typeLabel] = 0;
+      order.push(r.typeLabel);
+    }
+    counts[r.typeLabel]++;
+  });
+  if (order.length === 0) return CONFIG.FOLDER_NO_PROCESADO;
+  return order.reduce(function(best, label) { return counts[label] > counts[best] ? label : best; }, order[0]);
+}
+
+/** Deja una sola etiqueta del script en el hilo. Las etiquetas del cliente no se tocan. */
+function applyThreadLabel(thread, allLabels, shortName) {
+  var target = allLabels[shortName];
+  if (!target) {
+    Logger.log('>>> [ETIQUETA] No existe la etiqueta "' + getLabelPath(shortName) + '"');
+    return false;
   }
 
+  var targetPath = getLabelPath(shortName).toLowerCase();
+  var ownPaths = Object.keys(allLabels).map(function(n) { return getLabelPath(n).toLowerCase(); })
+    .concat((CONFIG.LEGACY_LABELS || []).map(function(n) { return n.toLowerCase(); }));
+
+  thread.getLabels().forEach(function(l) {
+    var name = l.getName().toLowerCase();
+    if (name !== targetPath && ownPaths.indexOf(name) !== -1) thread.removeLabel(l);
+  });
+
+  thread.addLabel(target);
+  return true;
+}
+
+function setupLabels() {
+  var existing = {};
+  GmailApp.getUserLabels().forEach(function(l) { existing[l.getName().toLowerCase()] = l; });
+
+  function ensureLabel(path) {
+    var found = existing[path.toLowerCase()];
+    if (found) return found;
+    try {
+      var created = GmailApp.createLabel(path);
+      existing[path.toLowerCase()] = created;
+      return created;
+    } catch (e) {
+      Logger.log('>>> [ETIQUETA] No se pudo crear "' + path + '": ' + e.toString());
+      return null;
+    }
+  }
+
+  if (CONFIG.LABEL_PARENT) ensureLabel(CONFIG.LABEL_PARENT);
+
+  var labels = {};
+  getClassificationLabelNames().forEach(function(name) {
+    var label = ensureLabel(getLabelPath(name));
+    if (label) labels[name] = label;
+  });
   return labels;
 }
 
+// ====================================================================================
+// === HOJAS, LOG Y NOTIFICACIONES ===
+// ====================================================================================
+
 function setupCompanyConfigs(root, headers) {
   var list = COMPANIES.concat([{ name: CONFIG.FOLDER_NO_PROCESADO }]);
-  return list.map(c => {
+  return list.map(function(c) {
     var folder = getOrCreateFolder(root, c.name);
     var sName = c.name + ' - Registros DTE';
     var files = folder.getFilesByName(sName);
@@ -761,12 +1384,22 @@ function setupCompanyConfigs(root, headers) {
       DriveApp.getRootFolder().removeFile(file);
     }
     var sheet = ss.getSheets()[0];
-    if (sheet.getLastRow() === 0) {
-      sheet.appendRow(headers);
-    } else if (sheet.getRange(1, headers.length).getValue() === '') {
-      sheet.getRange(1, headers.length).setValue(headers[headers.length - 1]);
-    }
+    ensureHeaders(sheet, headers);
     return { name: c.name, folder: folder, sheet: sheet, sheetName: sName };
+  });
+}
+
+function ensureHeaders(sheet, headers) {
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow(headers);
+    return;
+  }
+  if (sheet.getMaxColumns() < headers.length) {
+    sheet.insertColumnsAfter(sheet.getMaxColumns(), headers.length - sheet.getMaxColumns());
+  }
+  var current = sheet.getRange(1, 1, 1, headers.length).getValues()[0];
+  headers.forEach(function(h, i) {
+    if (current[i] === '') sheet.getRange(1, i + 1).setValue(h);
   });
 }
 
@@ -785,206 +1418,12 @@ function setupErrorLog(rootFolder) {
   return ss.getSheets()[0];
 }
 
-function logToErrorSheet(sheet, type, target, threadData, detail) {
-  sheet.appendRow([new Date(), type, target, threadData.from, threadData.subject, threadData.permalink, detail || ""]);
-}
-
-function attemptDownloadExternalFile(message, baseName, threadData, errorLogSheet) {
-  var body = message.getPlainBody();
-  var match = body.match(/(https?:\/\/[^\s\n]{5,})/i);
-  if (!match) return null;
-  var url = match[0].replace(/[>\]\)]+$/, '');
-  try {
-    var res = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true, timeoutSeconds: 30 });
-    var code = res.getResponseCode();
-    if (code === 200) {
-      var blob = res.getBlob();
-      var ct = (res.getHeaders()['Content-Type'] || '').toLowerCase();
-      var ext = ct.includes('pdf') ? 'pdf' : (ct.includes('zip') ? 'zip' : 'html');
-      blob.setName(baseName + "." + ext);
-      blob.externalUrlSource = url;
-      return blob;
-    } else {
-      logToErrorSheet(errorLogSheet, "HTTP " + code, url, threadData, "Fallo descarga PDF externo.");
-      return { logError: true, url: url };
-    }
-  } catch (e) {
-    logToErrorSheet(errorLogSheet, "Fetch Error", url, threadData, e.toString());
-    return { logError: true, url: url };
-  }
+/** source puede ser los datos del correo o un registro (ambos tienen from, subject y enlace). */
+function logToErrorSheet(sheet, type, target, source, detail) {
+  var link = source.permalink || source.threadPermalink || '';
+  sheet.appendRow([new Date(), type, target, source.from || '', source.subject || '', link, detail || ""]);
 }
 
 function sendAdminNotification(title, detail) {
-  MailApp.sendEmail(CONFIG.RECIPIENT_EMAIL, "⚠️ DTE Script CRÍTICO (ATS Group): " + title, detail);
-}
-// FUNCIONES DE MONITOREO Y SALUD 
-/**
- * Utilidad manual: verifica que existan y sean escribibles las hojas de registro de las empresas indicadas.
- */
-function quickHealthCheck() {
-  Logger.log('=== VERIFICACIÓN RÁPIDA DE SALUD ===');
-  var companies = ['ATS Group', 'No procesado'];
-  var allHealthy = true;
-  
-  companies.forEach(function(company) {
-    var sheetName = company + ' - Registros DTE';
-    var result = { name: company, healthy: false, message: '', lastRow: 0 };
-    
-    try {
-      var files = DriveApp.getFilesByName(sheetName);
-      if (files.hasNext()) {
-        var file = files.next();
-        var spreadsheet = SpreadsheetApp.openById(file.getId());
-        var sheet = spreadsheet.getSheets()[0];
-        var lastRow = sheet.getLastRow();
-        result.lastRow = lastRow;
-        
-        sheet.getRange(lastRow + 1, 1).setValue('TEST_HEALTH');
-        sheet.getRange(lastRow + 1, 1).clearContent();
-        result.healthy = true;
-        result.message = 'Saludable - ' + lastRow + ' filas';
-      } else {
-        result.message = 'Hoja no encontrada (se creará al procesar)';
-      }
-    } catch (healthError) {
-      allHealthy = false;
-      result.message = 'Error: ' + healthError.toString();
-    }
-    Logger.log(company + ': ' + result.message);
-  });
-  return allHealthy;
-}
-
-/**
- * Utilidad manual: muestra en el log cuántos triggers tiene configurados el proyecto.
- */
-function checkTriggerStatus() {
-  Logger.log('=== VERIFICACIÓN DE TRIGGERS ===');
-  var triggers = ScriptApp.getProjectTriggers();
-  if (triggers.length > 0) {
-    Logger.log('Triggers activos: ' + triggers.length);
-  } else {
-    Logger.log('❌ No hay triggers configurados en el proyecto');
-  }
-}
-/* Test para procesar diferentes estructuras dentro del json */
-
-function testIdentifyCompany() {
-  Logger.log('=== INICIO DE PRUEBAS DE ESTRUCTURA JSON ===');
-
-  // 1. Caso Estructura Antigua (emisor / receptor directo)
-  var jsonAntiguo = {
-    "emisor": { "nit": "03151306811028" },
-    "receptor": { "nit": "06143107971090" }
-  };
-
-  // 2. Caso Nueva Estructura (emisor.dte / cliente.dte)
-  var jsonNuevo = {
-    "emisor": {
-      "dte": { "nit": "03151306811028" }
-    },
-    "cliente": {
-      "dte": { "nit": "06143107971090" }
-    }
-  };
-
-  // 3. Caso Alternativo con numDocumento
-  var jsonConNumDocumento = {
-    "cliente": {
-      "dte": { "numDocumento": "0315-130681-102-8" }
-    }
-  };
-
-  // Ejecución de pruebas
-  var res1 = identifyCompany(jsonAntiguo);
-  Logger.log('Prueba 1 (Antiguo): ' + JSON.stringify(res1));
-
-  var res2 = identifyCompany(jsonNuevo);
-  Logger.log('Prueba 2 (Nuevo dte): ' + JSON.stringify(res2));
-
-  var res3 = getNit(jsonConNumDocumento, ['cliente.dte', 'receptor']);
-  Logger.log('Prueba 3 (getNit con guiones): ' + res3);
-
-  // Verificación visual de los resultados
-  if (res1.name !== FOLDER_NO_PROCESADO && res2.name !== FOLDER_NO_PROCESADO) {
-    Logger.log('TODAS LAS PRUEBAS PASARON CORRECTAMENTE.');
-  } else {
-    Logger.log('OCURRIÓ UN ERROR EN LA IDENTIFICACIÓN.');
-  }
-}
-
-/* Test para validar el funcionamiento de DTE pertenecientes a diferentes empresas */
-
-function testMultiCompanyProcessing() {
-  Logger.log('=== INICIO PRUEBA MULTI-DTE Y MULTI-EMPRESA EN UN MISMO CORREO ===');
-
-  // 1. Simulación de mensajes y blobs que vendrían en un mismo correo
-  var threadData = {
-    subject: "Facturas de prueba consolidadas",
-    from: "facturacion@proveedor.com",
-    date: new Date(),
-    permalink: "https://mail.google.com/test",
-    id: "msg_test_123"
-  };
-
-  // Simulación de JSON 1: Pertenece a ATS Group (03151306811028)
-  var jsonBlob1 = Utilities.newBlob(JSON.stringify({
-    emisor: { dte: { nit: "03151306811028" } },
-    cliente: { dte: { nit: "99999999999999" } }
-  }), 'application/json', 'Factura_ATS.json');
-
-  // Simulación de JSON 2: Pertenece a Walmart (06143107971090)
-  var jsonBlob2 = Utilities.newBlob(JSON.stringify({
-    emisor: { dte: { nit: "88888888888888" } },
-    cliente: { dte: { nit: "06143107971090" } }
-  }), 'application/json', 'Factura_Walmart.json');
-
-  var jsonAttachments = [jsonBlob1, jsonBlob2];
-  var processedAttachments = [jsonBlob1, jsonBlob2]; // Podrían incluirse PDFs simularizados aquí
-
-  // 2. Estructura de agrupación igual a la implementada en processDTEAttachments
-  var companyGroups = {};
-
-  for (var j = 0; j < jsonAttachments.length; j++) {
-    var currentJsonBlob = jsonAttachments[j];
-    var jsonContentString = currentJsonBlob.getDataAsString('UTF-8');
-    var jsonData = JSON.parse(jsonContentString);
-
-    if (jsonData) {
-      // Identificación individual por DTE
-      var dteClassification = identifyCompany(jsonData);
-      var companyKey = dteClassification.name;
-
-      Logger.log('Archivo "' + currentJsonBlob.getName() + '" clasificado como -> ' + companyKey + ' (' + dteClassification.type + ')');
-
-      if (!companyGroups[companyKey]) {
-        companyGroups[companyKey] = {
-          classification: dteClassification,
-          records: []
-        };
-      }
-
-      // Simular creación del registro
-      companyGroups[companyKey].records.push({
-        fileName: currentJsonBlob.getName(),
-        companyLabel: dteClassification.label
-      });
-    }
-  }
-
-  // 3. Verificación de Resultados
-  Logger.log('=== RESULTADOS DE LA AGRUPACIÓN ===');
-  var detectedKeys = Object.keys(companyGroups);
-  Logger.log('Empresas identificadas en el correo: ' + detectedKeys.join(', '));
-
-  detectedKeys.forEach(function(key) {
-    var group = companyGroups[key];
-    Logger.log('-> Empresa: ' + key + ' | Etiqueta Gmail: ' + group.classification.label + ' | Cantidad de archivos: ' + group.records.length);
-  });
-
-  if (detectedKeys.length > 1) {
-    Logger.log('PRUEBA EXITOSA: El correo se dividió correctamente entre ' + detectedKeys.length + ' empresas diferentes.');
-  } else {
-    Logger.log('PRUEBA FALLIDA: No se lograron separar las empresas.');
-  }
+  MailApp.sendEmail(CONFIG.RECIPIENT_EMAIL, "⚠️ DTE Script CRÍTICO (" + CONFIG.CLIENT_NAME + "): " + title, detail);
 }
