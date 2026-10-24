@@ -1,5 +1,5 @@
 /**
- * EXTRACCIÓN Y ORGANIZACIÓN DE DTE DESDE GMAIL - v4
+ * EXTRACCIÓN Y ORGANIZACIÓN DE DTE DESDE GMAIL - v3.1
  *
  * Busca en Gmail los DTE (JSON / PDF / XML, sueltos o en ZIP), los clasifica por empresa
  * (Compras / Ventas) según el NIT, los guarda en Drive por fecha de emisión y registra cada
