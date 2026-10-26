@@ -111,6 +111,7 @@ var PREFERRED_LINK_PATTERN = /dte|factura|invoice|pdf|json|zip|descarg|download|
 // ====================================================================================
 
 var EXECUTION_DEADLINE = 0;
+var CURRENT_THREAD_TAG = '';
 
 function TimeUpError() {
   this.timeUp = true;
@@ -154,7 +155,7 @@ function processDTEAttachments() {
     Logger.log('>>> [PREPARACIÓN] Carpetas y hojas listas (' + configs.length + ' hojas de registro) - ' + secondsSince(stepStart));
     var ctx = { labels: allLabels, configs: configs, errorLogSheet: errorLogSheet, threadCodeMeta: {} };
 
-    var searchQuery = CONFIG.GMAIL_SEARCH_QUERY || buildGmailSearchQuery();
+    var searchQuery = CONFIG.GMAIL_SEARCH_QUERY || buildGmailSearchQuery(allLabels);
     Logger.log('>>> [BANDEJA] Query: ' + searchQuery);
 
     var stats = { threads: 0, processed: 0, files: 0, duplicates: 0, others: 0, failed: 0, executionStopped: false };
@@ -183,6 +184,7 @@ function processDTEAttachments() {
 
         var thread = threads[i];
         var position = '[' + (i + 1) + '/' + threads.length + ']';
+        CURRENT_THREAD_TAG = position;
         stats.threads++;
 
         if (threadHasOwnLabel(thread, allLabels)) {
@@ -200,8 +202,8 @@ function processDTEAttachments() {
           clearThreadTimeouts(thread);
           Logger.log(position + ' "' + thread.getFirstMessageSubject() + '" -> ' + getLabelPath(ctx.lastLabel) +
             (stats.files > filesBefore ? ' | Guardados: ' + (stats.files - filesBefore) : '') +
-            (stats.duplicates > duplicatesBefore ? ' | Duplicados: ' + (stats.duplicates - duplicatesBefore) : '') +
-            ' | ' + secondsSince(threadStart));
+            (stats.duplicates > duplicatesBefore ? ' | Ya registrados antes: ' + (stats.duplicates - duplicatesBefore) : '') +
+            (labeled ? '' : ' | ⚠️ NO SE PUDO ETIQUETAR') + ' | ' + secondsSince(threadStart));
         } catch (threadErr) {
           if (threadErr.timeUp) {
             // Lo guardado hasta aquí no se duplica: el anti-duplicados lo omite al reintentar.
@@ -224,7 +226,7 @@ function processDTEAttachments() {
     SpreadsheetApp.flush();
     Logger.log('>>> [FIN] Hilos revisados: ' + stats.threads + ' | Con DTE: ' + stats.processed +
       ' | Otros: ' + stats.others + ' | Archivos guardados: ' + stats.files +
-      ' | Duplicados omitidos: ' + stats.duplicates + ' | Con error: ' + stats.failed +
+      ' | Ya registrados antes (omitidos): ' + stats.duplicates + ' | Con error: ' + stats.failed +
       ' | Duración: ' + secondsSince(runStart) +
       (stats.executionStopped ? ' | Quedan hilos pendientes para la próxima ejecución.' : ' | Buzón al día.'));
 
@@ -877,7 +879,7 @@ function fetchUrlCached(url, cache) {
   if (Object.prototype.hasOwnProperty.call(cache, url)) return cache[url];
   ensureTime(CONFIG.FETCH_RESERVE_MS);
   var hostMatch = url.match(/^https?:\/\/([^\/?#:]+)/i);
-  Logger.log('      Revisando enlace externo: ' + (hostMatch ? hostMatch[1] : url));
+  Logger.log(CURRENT_THREAD_TAG + ' Revisando enlace externo: ' + (hostMatch ? hostMatch[1] : url));
   var out;
   try {
     var res = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true });
@@ -1339,7 +1341,17 @@ function getClassificationLabelNames() {
 }
 
 function getLabelPath(shortName) {
-  return CONFIG.LABEL_PARENT ? CONFIG.LABEL_PARENT + '/' + shortName : shortName;
+  var name = shortName.replace(/\s+/g, ' ').trim();
+  return CONFIG.LABEL_PARENT ? CONFIG.LABEL_PARENT + '/' + name : name;
+}
+
+function normalizeLabelName(name) {
+  return (name || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+/** Nombres reales (normalizados) en Gmail de las etiquetas del script. */
+function getOwnLabelNames(allLabels) {
+  return Object.keys(allLabels).map(function(n) { return normalizeLabelName(allLabels[n].getName()); });
 }
 
 /** Forma de búsqueda de Gmail: "DTE/No procesado" -> "dte-no-procesado". */
@@ -1347,19 +1359,19 @@ function toGmailSearchLabel(path) {
   return path.toLowerCase().replace(/[\s\/]+/g, '-');
 }
 
-function buildGmailSearchQuery() {
+function buildGmailSearchQuery(allLabels) {
   var parts = [];
   if (CONFIG.GMAIL_SEARCH_SCOPE) parts.push(CONFIG.GMAIL_SEARCH_SCOPE);
   if (CONFIG.GMAIL_SEARCH_AFTER) parts.push('after:' + CONFIG.GMAIL_SEARCH_AFTER);
-  getClassificationLabelNames().forEach(function(name) {
-    parts.push('-label:' + toGmailSearchLabel(getLabelPath(name)));
+  Object.keys(allLabels).forEach(function(name) {
+    parts.push('-label:' + toGmailSearchLabel(allLabels[name].getName()));
   });
   return parts.join(' ');
 }
 
 function threadHasOwnLabel(thread, allLabels) {
-  var ownPaths = Object.keys(allLabels).map(function(n) { return getLabelPath(n).toLowerCase(); });
-  return thread.getLabels().some(function(l) { return ownPaths.indexOf(l.getName().toLowerCase()) !== -1; });
+  var own = getOwnLabelNames(allLabels);
+  return thread.getLabels().some(function(l) { return own.indexOf(normalizeLabelName(l.getName())) !== -1; });
 }
 
 /**
@@ -1394,43 +1406,59 @@ function applyThreadLabel(thread, allLabels, shortName) {
     return false;
   }
 
-  var targetPath = getLabelPath(shortName).toLowerCase();
-  var ownPaths = Object.keys(allLabels).map(function(n) { return getLabelPath(n).toLowerCase(); })
-    .concat((CONFIG.LEGACY_LABELS || []).map(function(n) { return n.toLowerCase(); }));
+  var targetName = normalizeLabelName(target.getName());
+  var own = getOwnLabelNames(allLabels).concat((CONFIG.LEGACY_LABELS || []).map(normalizeLabelName));
 
   thread.getLabels().forEach(function(l) {
-    var name = l.getName().toLowerCase();
-    if (name !== targetPath && ownPaths.indexOf(name) !== -1) thread.removeLabel(l);
+    var name = normalizeLabelName(l.getName());
+    if (name !== targetName && own.indexOf(name) !== -1) thread.removeLabel(l);
   });
 
   thread.addLabel(target);
   return true;
 }
 
+/**
+ * Busca cada etiqueta del script y la crea solo si no existe. La búsqueda ignora mayúsculas y
+ * espacios repetidos (Gmail los unifica). Si alguna no se puede preparar se detiene la ejecución:
+ * sin etiqueta los correos no quedan marcados y se revisarían de nuevo en cada ejecución.
+ */
 function setupLabels() {
   var existing = {};
-  GmailApp.getUserLabels().forEach(function(l) { existing[l.getName().toLowerCase()] = l; });
-
-  function ensureLabel(path) {
-    var found = existing[path.toLowerCase()];
-    if (found) return found;
-    try {
-      var created = GmailApp.createLabel(path);
-      existing[path.toLowerCase()] = created;
-      return created;
-    } catch (e) {
-      Logger.log('>>> [ETIQUETA] No se pudo crear "' + path + '": ' + e.toString());
-      return null;
-    }
+  function loadExisting() {
+    GmailApp.getUserLabels().forEach(function(l) { existing[normalizeLabelName(l.getName())] = l; });
   }
 
+  function ensureLabel(path) {
+    var key = normalizeLabelName(path);
+    if (existing[key]) return existing[key];
+    try {
+      existing[key] = GmailApp.createLabel(path);
+      Logger.log('>>> [ETIQUETA] Creada: ' + path);
+    } catch (e) {
+      // Puede existir con otra forma de escribirse: se vuelve a buscar antes de darla por perdida.
+      loadExisting();
+      existing[key] = existing[key] || GmailApp.getUserLabelByName(path);
+      if (!existing[key]) Logger.log('>>> [ETIQUETA] No se pudo crear ni encontrar "' + path + '": ' + e.toString());
+    }
+    return existing[key];
+  }
+
+  loadExisting();
   if (CONFIG.LABEL_PARENT) ensureLabel(CONFIG.LABEL_PARENT);
 
   var labels = {};
+  var missing = [];
   getClassificationLabelNames().forEach(function(name) {
     var label = ensureLabel(getLabelPath(name));
     if (label) labels[name] = label;
+    else missing.push(getLabelPath(name));
   });
+
+  if (missing.length > 0) {
+    throw new Error('No se pudieron preparar las etiquetas de Gmail: ' + missing.join(', ') +
+      '. Revisar los nombres en CONFIG o si existen etiquetas con nombres parecidos.');
+  }
   return labels;
 }
 
