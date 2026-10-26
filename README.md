@@ -80,7 +80,6 @@ Archivo del script: [`Extraer DTE de correos v3.txt`](Extraer%20DTE%20de%20corre
    - `COMPANIES`: una entrada por empresa con sus NIT (y el DUI si es persona natural). No usar `/` en el nombre.
      ```javascript
      COMPANIES: [
-       { name: 'ATS Group', nits: ['0315-130681-102-8'] },
        { name: 'Otra Empresa', nits: ['06140000000000', '02073991-2'] }
      ],
      ```
@@ -95,31 +94,3 @@ Archivo del script: [`Extraer DTE de correos v3.txt`](Extraer%20DTE%20de%20corre
 
 ---
 
-## Pruebas realizadas
-
-### Pruebas automáticas (Node.js, simulando las funciones de Apps Script)
-
-| Prueba | Resultado |
-|---|---|
-| Clasificación con el NIT del emisor o del receptor, `emisor.dte` / `cliente.dte`, campos `DOI`, `id`, `documento`, `numDocumento`, NIT con guiones y NIT numérico sin el cero inicial | ✅ |
-| Factura de Sujeto Excluido (tipo 14) emitida por la empresa → Compra | ✅ |
-| JSON dentro de otro objeto o como texto, y fecha en distintas rutas y formatos (`2025-03-14`, `14/03/2025`) | ✅ |
-| Correo con venta, compra y un documento de otra empresa: cada uno clasificado por separado, PDF unidos por código, adjunto sin código ignorado | ✅ |
-| ZIP real sin extensión con subcarpetas `compras/f1.json` y `ventas/f1.json` (mismo nombre de archivo) | ✅ cada PDF unido a su JSON |
-| ZIP con archivos ocultos de Mac (`__MACOSX`, `._*`, `.DS_Store`) | ✅ descartados, log vacío |
-| JSON en UTF-16, ZIP dentro de otro ZIP, XML sin JSON con su PDF | ✅ clasificados (el PDF hereda los datos del XML) |
-| Etiqueta única: con algún documento sin empresa → No procesado; si no, la empresa con más archivos; sin DTE → Otros. Quita solo las etiquetas propias del script | ✅ |
-| PDF sin JSON (con o sin código en el nombre) en un correo de factura → `DTE/Solo PDF`; un PDF cualquiera en un correo que no es de DTE → `DTE/Otros` | ✅ |
-| Correo con PDF sin JSON y un JSON de empresa desconocida → `DTE/No procesado` | ✅ |
-| Corte por tiempo: no abre enlaces si queda menos de 1 minuto y detiene el guardado a mitad de un correo | ✅ |
-
-### Pruebas en Apps Script (cuenta de pruebas ATS, 91 hilos)
-
-| Escenario | Resultado |
-|---|---|
-| Creación de las etiquetas `DTE/…`, incluida `DTE/Otros` (antes no se creaba) | ✅ |
-| Correos de prueba: DTE completo, solo JSON, solo PDF, JSON dañado, ZIP con varias facturas, varias empresas, DTE por enlace | ✅ 22 hilos con DTE, 69 en Otros, sin errores |
-| Anti-duplicados al volver a ejecutar | ✅ 69 duplicados omitidos |
-| Correos que mezclan empresas identificadas y no identificadas | ✅ etiqueta única `DTE/No procesado` |
-| ZIP real con varios documentos | ✅ cada archivo en la carpeta de su empresa |
-| Ejecución con el depurador en la cuenta de evaluación (3 empresas) | ❌ superó los 6 minutos: el tiempo solo se revisaba entre correos. Corregido en la v3.1, pendiente de volver a probar |
