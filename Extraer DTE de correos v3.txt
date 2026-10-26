@@ -7,9 +7,8 @@
  *
  * Entrada: processDTEAttachments (trigger por tiempo).
  * Drive:   <Empresa>/<Año - Empresa>/<MM-Mes-Año - Empresa>/<Compras|Ventas - Empresa>
- * Gmail:   una etiqueta por hilo bajo "DTE/": <Empresa>-Compras, <Empresa>-Ventas, No procesado u Otros.
- *
- * Requiere el servicio avanzado "Drive API" para leer el texto de los PDF que llegan sin JSON.
+ * Gmail:   una etiqueta por hilo bajo "DTE/": <Empresa>-Compras, <Empresa>-Ventas, No procesado,
+ *          Solo PDF (PDF sin JSON, pendiente de revisión) u Otros.
  */
 
 // ====================================================================================
@@ -34,6 +33,7 @@ var CONFIG = {
   LABEL_PARENT: 'DTE',
   FOLDER_NO_PROCESADO: 'No procesado',
   LABEL_OTROS: 'Otros',
+  LABEL_SOLO_PDF: 'Solo PDF',
   LABEL_COMPRAS_SUFFIX: '-Compras',
   LABEL_VENTAS_SUFFIX: '-Ventas',
   LEGACY_LABELS: ['DTE-Procesado'],
@@ -46,8 +46,7 @@ var CONFIG = {
   LABEL_PDF_MISSING: 'PDF - No encontrado',
   LABEL_JSON_MISSING: 'JSON - No encontrado',
 
-  MAX_LINKS_PER_MESSAGE: 6,
-  ENABLE_PDF_OCR: true,
+  MAX_LINKS_PER_MESSAGE: 4,
   DTE_KEYWORDS: [
     'dte', 'factura', 'comprobante', 'crédito fiscal', 'credito fiscal', 'código de generación',
     'codigo de generacion', 'documento tributario', 'nota de crédito', 'nota de credito',
@@ -57,8 +56,13 @@ var CONFIG = {
   // Tipos de DTE que emite el comprador (14 = Sujeto Excluido): se invierte Compras/Ventas.
   INVERTED_DTE_TYPES: ['14'],
 
+  // Google corta a los 6 min. Se deja de iniciar trabajo a los 4 min y no se abren enlaces
+  // si queda menos de FETCH_RESERVE_MS. Un hilo que agota el tiempo MAX_THREAD_TIMEOUTS veces
+  // se manda a No procesado para que no bloquee las siguientes ejecuciones.
   MAX_EXECUTION_TIME_MS: 5 * 60 * 1000,
-  SAFETY_MARGIN_MS: 30 * 1000,
+  SAFETY_MARGIN_MS: 60 * 1000,
+  FETCH_RESERVE_MS: 60 * 1000,
+  MAX_THREAD_TIMEOUTS: 2,
 
   MONTH_NAMES: [
     "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
@@ -93,7 +97,7 @@ var DTE_TYPE_NAMES = {
   '15': 'Comprobante de Donación'
 };
 
-var NIT_KEYS = ['dte', 'nit', 'doi', 'numDocumento', 'numeroDocumento', 'documento', 'numDoc', 'id', 'numId', 'identificacion'];
+var NIT_KEYS = ['dte', 'nit', 'dui', 'numDocumento', 'numeroDocumento', 'documento', 'numDoc', 'id', 'numId', 'identificacion'];
 
 var IGNORED_LINK_DOMAINS = [
   'google.com', 'facebook.com', 'twitter.com', 'x.com', 'instagram.com', 'linkedin.com',
@@ -106,12 +110,29 @@ var PREFERRED_LINK_PATTERN = /dte|factura|invoice|pdf|json|zip|descarg|download|
 // === MOTOR PRINCIPAL ===
 // ====================================================================================
 
-function processDTEAttachments() {
-  var startTime = new Date().getTime();
+var EXECUTION_DEADLINE = 0;
 
-  function shouldStopExecution() {
-    return (new Date().getTime() - startTime) > (CONFIG.MAX_EXECUTION_TIME_MS - CONFIG.SAFETY_MARGIN_MS);
-  }
+function TimeUpError() {
+  this.timeUp = true;
+  this.message = 'Tiempo de ejecución agotado';
+}
+
+function timeLeftMs() {
+  return EXECUTION_DEADLINE - new Date().getTime();
+}
+
+/** Corta el hilo en curso si no queda tiempo para la siguiente operación. */
+function ensureTime(neededMs) {
+  if (timeLeftMs() < (neededMs || 0)) throw new TimeUpError();
+}
+
+function secondsSince(startMs) {
+  return ((new Date().getTime() - startMs) / 1000).toFixed(1) + ' s';
+}
+
+function processDTEAttachments() {
+  var runStart = new Date().getTime();
+  EXECUTION_DEADLINE = new Date().getTime() + CONFIG.MAX_EXECUTION_TIME_MS - CONFIG.SAFETY_MARGIN_MS;
 
   var lock = LockService.getScriptLock();
   if (!lock.tryLock(10000)) {
@@ -122,10 +143,15 @@ function processDTEAttachments() {
   try {
     Logger.log('>>> [INICIO] Ejecutando motor DTE');
 
+    var stepStart = new Date().getTime();
     var allLabels = setupLabels();
+    Logger.log('>>> [PREPARACIÓN] Etiquetas de Gmail listas (' + Object.keys(allLabels).length + ') - ' + secondsSince(stepStart));
+
+    stepStart = new Date().getTime();
     var dteMainFolder = getOrCreateRootFolder();
     var configs = setupCompanyConfigs(dteMainFolder, CONFIG.SHEET_HEADERS);
     var errorLogSheet = setupErrorLog(dteMainFolder);
+    Logger.log('>>> [PREPARACIÓN] Carpetas y hojas listas (' + configs.length + ' hojas de registro) - ' + secondsSince(stepStart));
     var ctx = { labels: allLabels, configs: configs, errorLogSheet: errorLogSheet, threadCodeMeta: {} };
 
     var searchQuery = CONFIG.GMAIL_SEARCH_QUERY || buildGmailSearchQuery();
@@ -135,44 +161,72 @@ function processDTEAttachments() {
     var pageSize = CONFIG.GMAIL_PAGE_SIZE || 100;
     // Los hilos etiquetados salen de la búsqueda; offset solo avanza por los que quedan sin etiqueta.
     var offset = 0;
+    var page = 0;
 
     pageLoop:
     while (true) {
       var threads = GmailApp.search(searchQuery, offset, pageSize);
-      if (threads.length === 0) break;
+      if (threads.length === 0) {
+        if (page === 0) Logger.log('>>> [BANDEJA] No hay correos nuevos por revisar.');
+        break;
+      }
+      page++;
+      Logger.log('>>> [BANDEJA] Página ' + page + ': ' + threads.length + ' hilos por revisar' +
+        (threads.length === pageSize ? ' (puede haber más en la siguiente página)' : '') +
+        ' | Tiempo disponible: ' + Math.max(0, Math.round(timeLeftMs() / 1000)) + ' s');
 
       for (var i = 0; i < threads.length; i++) {
-        if (shouldStopExecution()) {
+        if (timeLeftMs() <= 0) {
           stats.executionStopped = true;
           break pageLoop;
         }
 
         var thread = threads[i];
+        var position = '[' + (i + 1) + '/' + threads.length + ']';
         stats.threads++;
 
         if (threadHasOwnLabel(thread, allLabels)) {
+          Logger.log(position + ' Ya clasificado, se omite: "' + thread.getFirstMessageSubject() + '"');
           offset++;
           continue;
         }
 
         var labeled = false;
+        var threadStart = new Date().getTime();
+        var filesBefore = stats.files;
+        var duplicatesBefore = stats.duplicates;
         try {
           labeled = processThread(thread, ctx, stats);
+          clearThreadTimeouts(thread);
+          Logger.log(position + ' "' + thread.getFirstMessageSubject() + '" -> ' + getLabelPath(ctx.lastLabel) +
+            (stats.files > filesBefore ? ' | Guardados: ' + (stats.files - filesBefore) : '') +
+            (stats.duplicates > duplicatesBefore ? ' | Duplicados: ' + (stats.duplicates - duplicatesBefore) : '') +
+            ' | ' + secondsSince(threadStart));
         } catch (threadErr) {
+          if (threadErr.timeUp) {
+            // Lo guardado hasta aquí no se duplica: el anti-duplicados lo omite al reintentar.
+            registerThreadTimeout(thread, new Date().getTime() - threadStart);
+            stats.executionStopped = true;
+            break pageLoop;
+          }
           stats.failed++;
-          Logger.log('>>> [ERROR HILO] ' + threadErr.toString());
+          Logger.log(position + ' [ERROR] "' + thread.getFirstMessageSubject() + '": ' + threadErr.toString());
           logToErrorSheet(errorLogSheet, 'Error procesando hilo', thread.getFirstMessageSubject(),
             { from: '', subject: thread.getFirstMessageSubject(), permalink: thread.getPermalink() }, threadErr.toString());
         }
         if (!labeled) offset++;
       }
+
+      Logger.log('>>> [PROGRESO] Revisados: ' + stats.threads + ' | Con DTE: ' + stats.processed +
+        ' | Archivos guardados: ' + stats.files + ' | Tiempo disponible: ' + Math.max(0, Math.round(timeLeftMs() / 1000)) + ' s');
     }
 
     SpreadsheetApp.flush();
     Logger.log('>>> [FIN] Hilos revisados: ' + stats.threads + ' | Con DTE: ' + stats.processed +
       ' | Otros: ' + stats.others + ' | Archivos guardados: ' + stats.files +
       ' | Duplicados omitidos: ' + stats.duplicates + ' | Con error: ' + stats.failed +
-      (stats.executionStopped ? ' | Quedan hilos pendientes para la próxima ejecución.' : ''));
+      ' | Duración: ' + secondsSince(runStart) +
+      (stats.executionStopped ? ' | Quedan hilos pendientes para la próxima ejecución.' : ' | Buzón al día.'));
 
   } catch (e) {
     Logger.log('>>> [ERROR CRÍTICO GENERAL] ' + e.toString());
@@ -190,7 +244,17 @@ function processThread(thread, ctx, stats) {
 
   if (firstMsgSubject.includes('dte script crítico') || firstMsgSubject.includes('security alert') || firstMsgFrom.includes('no-reply@accounts.google.com')) {
     stats.others++;
-    return applyThreadLabel(thread, ctx.labels, CONFIG.LABEL_OTROS);
+    ctx.lastLabel = CONFIG.LABEL_OTROS;
+    return applyThreadLabel(thread, ctx.labels, ctx.lastLabel);
+  }
+
+  if (getThreadTimeouts(thread) >= CONFIG.MAX_THREAD_TIMEOUTS) {
+    logToErrorSheet(ctx.errorLogSheet, 'Hilo demasiado largo', thread.getFirstMessageSubject(),
+      { from: threadMessages[0].getFrom(), subject: thread.getFirstMessageSubject(), permalink: thread.getPermalink() },
+      'Agotó el tiempo de ejecución ' + CONFIG.MAX_THREAD_TIMEOUTS + ' veces. Revisar manualmente.');
+    stats.failed++;
+    ctx.lastLabel = CONFIG.FOLDER_NO_PROCESADO;
+    return applyThreadLabel(thread, ctx.labels, ctx.lastLabel);
   }
 
   var threadPermalink = thread.getPermalink();
@@ -198,6 +262,7 @@ function processThread(thread, ctx, stats) {
   ctx.threadCodeMeta = {};
 
   threadMessages.forEach(function(message) {
+    ensureTime(0);
     var threadData = {
       subject: message.getSubject(),
       from: message.getFrom(),
@@ -223,7 +288,25 @@ function processThread(thread, ctx, stats) {
     stats.others++;
   }
 
-  return applyThreadLabel(thread, ctx.labels, resolveThreadLabel(records));
+  ctx.lastLabel = resolveThreadLabel(records);
+  return applyThreadLabel(thread, ctx.labels, ctx.lastLabel);
+}
+
+/** Veces que un hilo agotó el tiempo (en Propiedades del script). */
+function getThreadTimeouts(thread) {
+  return Number(PropertiesService.getScriptProperties().getProperty('timeout_' + thread.getId()) || 0);
+}
+
+/** Solo cuenta si el propio hilo consumió tiempo (no si empezó cuando ya quedaba poco). */
+function registerThreadTimeout(thread, elapsedMs) {
+  Logger.log('>>> [TIEMPO] Se agotó el tiempo en: "' + thread.getFirstMessageSubject() + '" (' + Math.round(elapsedMs / 1000) + ' s)');
+  if (elapsedMs < 60 * 1000) return;
+  PropertiesService.getScriptProperties().setProperty('timeout_' + thread.getId(), String(getThreadTimeouts(thread) + 1));
+}
+
+function clearThreadTimeouts(thread) {
+  var props = PropertiesService.getScriptProperties();
+  if (props.getProperty('timeout_' + thread.getId())) props.deleteProperty('timeout_' + thread.getId());
 }
 
 /**
@@ -415,7 +498,7 @@ function analyzeMessage(message, assets, threadData, ctx) {
   var uniqueClassif = getUniqueCompanyClassification(docs);
   pending.sort(function(x, y) { return (x.fmt === 'xml' ? 0 : 1) - (y.fmt === 'xml' ? 0 : 1); });
   pending.forEach(function(a) {
-    records = records.concat(buildOrphanRecords(a, threadData, ctx, hasHints, uniqueClassif));
+    records = records.concat(buildOrphanRecords(a, threadData, ctx, hasHints, uniqueClassif, docs.length > 0));
   });
 
   return records;
@@ -598,6 +681,11 @@ function noProcesadoClassification() {
   return { name: CONFIG.FOLDER_NO_PROCESADO, type: 'DTE', label: CONFIG.FOLDER_NO_PROCESADO };
 }
 
+/** PDF sin JSON que no se pudo identificar: se guarda en No procesado con su propia etiqueta. */
+function soloPdfClassification() {
+  return { name: CONFIG.FOLDER_NO_PROCESADO, type: 'DTE', label: CONFIG.LABEL_SOLO_PDF };
+}
+
 function identifyCompany(jsonData, tipoCodigo) {
   var inverted = CONFIG.INVERTED_DTE_TYPES.indexOf(tipoCodigo) !== -1;
   var emisor = getPartyNit(jsonData, ['emisor', 'donatario']);
@@ -612,50 +700,18 @@ function identifyCompany(jsonData, tipoCodigo) {
 }
 
 // ====================================================================================
-// === LECTURA DE PDF / XML SIN JSON ===
+// === ARCHIVOS SIN JSON (XML / PDF) ===
 // ====================================================================================
 
+/** Texto de un XML. Los PDF no se leen (sin OCR): devuelve vacío. */
 function getAssetText(asset) {
   if (asset.text !== undefined) return asset.text;
   try {
-    asset.text = asset.fmt === 'pdf' ? extractPdfText(asset.blob) : readBlobText(asset.blob);
+    asset.text = asset.fmt === 'pdf' ? '' : readBlobText(asset.blob);
   } catch (e) {
     asset.text = '';
   }
   return asset.text;
-}
-
-var _ocrWarningShown = false;
-
-/** Texto de un PDF convirtiéndolo temporalmente a Google Docs (requiere Drive API). */
-function extractPdfText(blob) {
-  if (!CONFIG.ENABLE_PDF_OCR) return '';
-  if (typeof Drive === 'undefined') {
-    if (!_ocrWarningShown) {
-      Logger.log('>>> [OCR] Servicio avanzado "Drive API" no activado.');
-      _ocrWarningShown = true;
-    }
-    return '';
-  }
-
-  var tempId = null;
-  try {
-    var media = (blob.copyBlob ? blob.copyBlob() : blob).setContentType('application/pdf');
-    var docType = 'application/vnd.google-apps.document';
-    if (typeof Drive.Files.create === 'function') {
-      tempId = Drive.Files.create({ name: 'tmp_ocr_dte', mimeType: docType }, media, { ocrLanguage: 'es' }).id;
-    } else {
-      tempId = Drive.Files.insert({ title: 'tmp_ocr_dte', mimeType: docType }, media, { ocr: true, ocrLanguage: 'es' }).id;
-    }
-    return DocumentApp.openById(tempId).getBody().getText();
-  } catch (e) {
-    Logger.log('>>> [OCR] No se pudo leer el PDF: ' + e.toString());
-    return '';
-  } finally {
-    if (tempId) {
-      try { DriveApp.getFileById(tempId).setTrashed(true); } catch (trashErr) {}
-    }
-  }
 }
 
 /** Códigos de Generación, fecha de emisión, tipo y NITs (en orden de aparición) de un texto. */
@@ -728,7 +784,7 @@ function buildXmlDteMeta(text, fileName) {
   }
 
   var idBlock = block('identificacion') || text;
-  var nitTags = ['nit', 'numDocumento', 'numeroDocumento', 'doi', 'documento'];
+  var nitTags = ['nit', 'numDocumento', 'numeroDocumento', 'dui', 'documento'];
   var dte = {
     identificacion: {
       codigoGeneracion: value(idBlock, ['codigoGeneracion']),
@@ -742,13 +798,18 @@ function buildXmlDteMeta(text, fileName) {
   return buildDteMeta(dte, fileName);
 }
 
-function buildOrphanRecords(asset, threadData, ctx, hasHints, fallbackClassif) {
-  var wantText = asset.fmt === 'xml' || hasHints || looksLikeDteName(asset.name);
-  var text = wantText ? getAssetText(asset) : '';
+/**
+ * Registros de un PDF/XML sin JSON. El XML se clasifica por su contenido. El PDF hereda los datos
+ * si su código ya se registró; si no, queda como "Solo PDF" para revisión manual. Un PDF sin
+ * código en el nombre solo se registra si el correo no trae JSON y parece de DTE.
+ */
+function buildOrphanRecords(asset, threadData, ctx, hasHints, fallbackClassif, messageHasJson) {
+  var text = asset.fmt === 'xml' ? getAssetText(asset) : '';
   var info = extractInfoFromText(text);
   var xmlMeta = asset.fmt === 'xml' ? buildXmlDteMeta(text, asset.name) : null;
   var codigo = (xmlMeta && xmlMeta.codigo) || extractGuidFromName(asset.name) || info.codigos[0] || '';
-  if (ORPHAN_REQUIRE_DTE_NAME && !codigo) return [];
+  var probablePdfDte = asset.fmt === 'pdf' && hasHints && !messageHasJson;
+  if (ORPHAN_REQUIRE_DTE_NAME && !codigo && !probablePdfDte) return [];
 
   // Si el JSON (o XML) de este código ya se leyó, se heredan sus datos.
   var known = codigo ? lookupCodeMeta(ctx, codigo) : null;
@@ -757,7 +818,8 @@ function buildOrphanRecords(asset, threadData, ctx, hasHints, fallbackClassif) {
     codigo: codigo,
     fecha: (known && known.fecha) || (xmlMeta && xmlMeta.fecha) || info.fecha || '',
     tipoNombre: (known && known.tipoNombre) || (xmlMeta && xmlMeta.tipoNombre) || getTipoNombre(info.tipoCodigo),
-    classif: (known && known.classif) || xmlClassif || identifyCompanyFromNits(info.nits) || fallbackClassif || noProcesadoClassification()
+    classif: (known && known.classif) || xmlClassif || identifyCompanyFromNits(info.nits) || fallbackClassif ||
+      (asset.fmt === 'pdf' ? soloPdfClassification() : noProcesadoClassification())
   };
   if (xmlMeta) rememberCodeMeta(ctx, meta);
 
@@ -813,6 +875,9 @@ function extractCandidateLinks(message) {
 
 function fetchUrlCached(url, cache) {
   if (Object.prototype.hasOwnProperty.call(cache, url)) return cache[url];
+  ensureTime(CONFIG.FETCH_RESERVE_MS);
+  var hostMatch = url.match(/^https?:\/\/([^\/?#:]+)/i);
+  Logger.log('      Revisando enlace externo: ' + (hostMatch ? hostMatch[1] : url));
   var out;
   try {
     var res = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true });
@@ -984,6 +1049,7 @@ function saveThreadData(ctx, records, threadData) {
   var folderCache = {};
 
   records.forEach(function(r) {
+    ensureTime(0);
     var config = findConfig(ctx.configs, r.companyName);
     if (!config) return;
 
@@ -1267,6 +1333,7 @@ function getClassificationLabelNames() {
     names.push(c.name + CONFIG.LABEL_VENTAS_SUFFIX);
   });
   names.push(CONFIG.FOLDER_NO_PROCESADO);
+  names.push(CONFIG.LABEL_SOLO_PDF);
   names.push(CONFIG.LABEL_OTROS);
   return names;
 }
@@ -1296,12 +1363,15 @@ function threadHasOwnLabel(thread, allLabels) {
 }
 
 /**
- * Etiqueta única del hilo. No procesado si algún documento no se asignó a una empresa (para
- * revisión manual); si no, la empresa/tipo con más archivos (en empate, el primero). Otros si no hay DTE.
+ * Etiqueta única del hilo, para revisión manual primero: No procesado si algún DTE no se asignó a una
+ * empresa; Solo PDF si lo pendiente son PDF sin JSON; si no, la empresa/tipo con más archivos
+ * (en empate, el primero). Otros si no hay DTE.
  */
 function resolveThreadLabel(records) {
   if (records.length === 0) return CONFIG.LABEL_OTROS;
-  if (records.some(function(r) { return r.classType === 'DTE'; })) return CONFIG.FOLDER_NO_PROCESADO;
+  var pending = records.filter(function(r) { return r.classType === 'DTE'; });
+  if (pending.some(function(r) { return r.typeLabel !== CONFIG.LABEL_SOLO_PDF; })) return CONFIG.FOLDER_NO_PROCESADO;
+  if (pending.length > 0) return CONFIG.LABEL_SOLO_PDF;
   var counts = {};
   var order = [];
   records.forEach(function(r) {
