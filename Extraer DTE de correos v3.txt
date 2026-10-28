@@ -242,6 +242,21 @@ function processThread(thread, ctx, stats) {
   var firstMsgSubject = threadMessages[0].getSubject().toLowerCase();
   var firstMsgFrom = threadMessages[0].getFrom().toLowerCase();
 
+//Ignorar correos informativos, resúmenes contables o reportes que no son DTEs
+if (firstMsgSubject.includes('dte script crítico') || 
+      firstMsgSubject.includes('security alert') || 
+      firstMsgSubject.includes('resumen ejecutivo contable y fiscal') ||
+      firstMsgSubject.includes('reportes de transacciones pos') ||
+      firstMsgFrom.includes('no-reply@accounts.google.com')) {
+    
+    ctx.lastLabel = CONFIG.LABEL_OTROS;
+    if (ctx.labels && ctx.labels[CONFIG.PROCESSED_LABEL_NAME]) {
+      thread.addLabel(ctx.labels[CONFIG.PROCESSED_LABEL_NAME]);
+    }
+    stats.others++;
+    return applyThreadLabel(thread, ctx.labels, ctx.lastLabel);
+  }
+
   if (firstMsgSubject.includes('dte script crítico') || firstMsgSubject.includes('security alert') || firstMsgFrom.includes('no-reply@accounts.google.com')) {
     stats.others++;
     ctx.lastLabel = CONFIG.LABEL_OTROS;
@@ -1412,14 +1427,22 @@ function setupLabels() {
   GmailApp.getUserLabels().forEach(function(l) { existing[l.getName().toLowerCase()] = l; });
 
   function ensureLabel(path) {
-    var found = existing[path.toLowerCase()];
+    var pathLower = path.toLowerCase();
+    var found = existing[pathLower] || GmailApp.getUserLabelByName(path);
     if (found) return found;
+    
     try {
       var created = GmailApp.createLabel(path);
-      existing[path.toLowerCase()] = created;
+      existing[pathLower] = created;
       return created;
     } catch (e) {
-      Logger.log('>>> [ETIQUETA] No se pudo crear "' + path + '": ' + e.toString());
+      // Si Gmail da error porque ya existe o hay conflicto, la recupera de forma segura
+      var recovered = GmailApp.getUserLabelByName(path);
+      if (recovered) {
+        existing[pathLower] = recovered;
+        return recovered;
+      }
+      Logger.log('>>> [ETIQUETA] No se pudo crear/recuperar "' + path + '": ' + e.toString());
       return null;
     }
   }
@@ -1431,9 +1454,23 @@ function setupLabels() {
     var label = ensureLabel(getLabelPath(name));
     if (label) labels[name] = label;
   });
+
+  // Se asegura también las etiquetas de control adicionales sin romper la estructura
+  if (CONFIG.FOLDER_NO_PROCESADO) {
+    var lblNoProc = ensureLabel(CONFIG.FOLDER_NO_PROCESADO);
+    if (lblNoProc) labels[CONFIG.FOLDER_NO_PROCESADO] = lblNoProc;
+  }
+  if (CONFIG.LABEL_OTROS) {
+    var lblOtros = ensureLabel(CONFIG.LABEL_OTROS);
+    if (lblOtros) labels[CONFIG.LABEL_OTROS] = lblOtros;
+  }
+  if (CONFIG.PROCESSED_LABEL_NAME) {
+    var lblProc = ensureLabel(CONFIG.PROCESSED_LABEL_NAME);
+    if (lblProc) labels[CONFIG.PROCESSED_LABEL_NAME] = lblProc;
+  }
+
   return labels;
 }
-
 // ====================================================================================
 // === HOJAS, LOG Y NOTIFICACIONES ===
 // ====================================================================================
