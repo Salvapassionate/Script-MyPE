@@ -177,8 +177,7 @@ function processDTEAttachments() {
       }
       page++;
       Logger.log('>>> [BANDEJA] Página ' + page + ': ' + threads.length + ' hilos por revisar' +
-        (threads.length === pageSize ? ' (puede haber más en la siguiente página)' : '') +
-        ' | Tiempo disponible: ' + Math.max(0, Math.round(timeLeftMs() / 1000)) + ' s');
+        (threads.length === pageSize ? ' (puede haber más en la siguiente página)' : ''));
 
       for (var i = 0; i < threads.length; i++) {
         if (timeLeftMs() <= 0) {
@@ -200,13 +199,11 @@ function processDTEAttachments() {
         var labeled = false;
         var threadStart = new Date().getTime();
         var filesBefore = stats.files;
-        var duplicatesBefore = stats.duplicates;
         try {
           labeled = processThread(thread, ctx, stats);
           clearThreadTimeouts(thread);
           Logger.log(position + ' "' + thread.getFirstMessageSubject() + '" -> ' + getLabelPath(ctx.lastLabel) +
             (stats.files > filesBefore ? ' | Guardados: ' + (stats.files - filesBefore) : '') +
-            (stats.duplicates > duplicatesBefore ? ' | Ya registrados antes: ' + (stats.duplicates - duplicatesBefore) : '') +
             (labeled ? '' : ' | ⚠️ NO SE PUDO ETIQUETAR') + ' | ' + secondsSince(threadStart));
         } catch (threadErr) {
           if (threadErr.timeUp) {
@@ -224,13 +221,13 @@ function processDTEAttachments() {
       }
 
       Logger.log('>>> [PROGRESO] Revisados: ' + stats.threads + ' | Con DTE: ' + stats.processed +
-        ' | Archivos guardados: ' + stats.files + ' | Tiempo disponible: ' + Math.max(0, Math.round(timeLeftMs() / 1000)) + ' s');
+        ' | Archivos guardados: ' + stats.files);
     }
 
     SpreadsheetApp.flush();
     Logger.log('>>> [FIN] Hilos revisados: ' + stats.threads + ' | Con DTE: ' + stats.processed +
       ' | Otros: ' + stats.others + ' | Archivos guardados: ' + stats.files +
-      ' | Ya registrados antes (omitidos): ' + stats.duplicates + ' | Con error: ' + stats.failed +
+      ' | Con error: ' + stats.failed +
       ' | Duración: ' + secondsSince(runStart) +
       (stats.executionStopped ? ' | Quedan hilos pendientes para la próxima ejecución.' : ' | Buzón al día.'));
 
