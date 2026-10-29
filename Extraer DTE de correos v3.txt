@@ -37,6 +37,10 @@ var CONFIG = {
   LABEL_COMPRAS_SUFFIX: '-Compras',
   LABEL_VENTAS_SUFFIX: '-Ventas',
   LEGACY_LABELS: ['DTE-Procesado'],
+  // Asuntos (en minúsculas) de correos que nunca son DTE: van directo a Otros.
+  IGNORED_SUBJECTS: [
+    'dte script crítico', 'security alert', 'resumen ejecutivo contable y fiscal', 'reportes de transacciones pos'
+  ],
 
   GMAIL_SEARCH_SCOPE: '-in:chats -in:drafts',
   GMAIL_SEARCH_AFTER: '', 
@@ -244,7 +248,9 @@ function processThread(thread, ctx, stats) {
   var firstMsgSubject = threadMessages[0].getSubject().toLowerCase();
   var firstMsgFrom = threadMessages[0].getFrom().toLowerCase();
 
-  if (firstMsgSubject.includes('dte script crítico') || firstMsgSubject.includes('security alert') || firstMsgFrom.includes('no-reply@accounts.google.com')) {
+  // Correos informativos, de sistema o reportes que no son DTE.
+  var ignoredSubject = CONFIG.IGNORED_SUBJECTS.some(function(t) { return firstMsgSubject.includes(t); });
+  if (ignoredSubject || firstMsgFrom.includes('no-reply@accounts.google.com')) {
     stats.others++;
     ctx.lastLabel = CONFIG.LABEL_OTROS;
     return applyThreadLabel(thread, ctx.labels, ctx.lastLabel);
@@ -1461,7 +1467,6 @@ function setupLabels() {
   }
   return labels;
 }
-
 // ====================================================================================
 // === HOJAS, LOG Y NOTIFICACIONES ===
 // ====================================================================================
