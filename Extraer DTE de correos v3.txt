@@ -112,10 +112,10 @@ var PREFERRED_LINK_PATTERN = /dte|factura|invoice|pdf|json|zip|descarg|download|
 
 var EXECUTION_DEADLINE = 0;
 
-function TimeUpError() {
+var TimeUpError = function() {
   this.timeUp = true;
   this.message = 'Tiempo de ejecución agotado';
-}
+};
 
 function timeLeftMs() {
   return EXECUTION_DEADLINE - new Date().getTime();
