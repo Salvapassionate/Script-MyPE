@@ -26,6 +26,8 @@ var CONFIG = {
 
   RECIPIENT_EMAIL: 'facturacion.atsgroup@gmail.com',
 
+
+
   DTE_ROOT_FOLDER_ID: '10z96hTPJyczJD9e--FFHWk1b19rFqIfl', // Modificar dirección de Drive
   DTE_ROOT_FOLDER_NAME: 'Registros DTE',
   ERROR_LOG_NAME: 'Log de Errores DTE',
