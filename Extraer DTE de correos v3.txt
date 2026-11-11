@@ -36,6 +36,8 @@ var CONFIG = {
   FOLDER_NO_PROCESADO: 'No procesado',
   LABEL_OTROS: 'Otros',
   LABEL_SOLO_PDF: 'Solo PDF',
+  // DTE leído correctamente cuyo NIT/DUI no es de ninguna empresa configurada. No se guarda en Drive ni en hojas.
+  LABEL_NO_IDENTIFICADO: 'No identificado',
   LABEL_COMPRAS_SUFFIX: '-Compras',
   LABEL_VENTAS_SUFFIX: '-Ventas',
   LEGACY_LABELS: ['DTE-Procesado'],
@@ -63,12 +65,13 @@ var CONFIG = {
   INVERTED_DTE_TYPES: ['14'],
 
   // Google corta a los 6 min. Se deja de iniciar trabajo a los 4 min y no se abren enlaces
-  // si queda menos de FETCH_RESERVE_MS. Un hilo que agota el tiempo MAX_THREAD_TIMEOUTS veces
-  // se manda a No procesado para que no bloquee las siguientes ejecuciones.
+  // si queda menos de FETCH_RESERVE_MS. Un hilo que agota el tiempo MAX_THREAD_TIMEOUTS veces,
+  // o que trae un ZIP de más de MAX_ZIP_SIZE_MB, se manda a Otros para no bloquear a los demás.
   MAX_EXECUTION_TIME_MS: 5 * 60 * 1000,
   SAFETY_MARGIN_MS: 60 * 1000,
   FETCH_RESERVE_MS: 60 * 1000,
   MAX_THREAD_TIMEOUTS: 2,
+  MAX_ZIP_SIZE_MB: 5,
 
   MONTH_NAMES: [
     "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
@@ -118,10 +121,19 @@ var PREFERRED_LINK_PATTERN = /dte|factura|invoice|pdf|json|zip|descarg|download|
 
 var EXECUTION_DEADLINE = 0;
 var CURRENT_THREAD_TAG = '';
+var CURRENT_THREAD_ID = '';
+var CURRENT_THREAD_MARKED = false;
 
 var TimeUpError = function() {
   this.timeUp = true;
   this.message = 'Tiempo de ejecución agotado';
+};
+
+/** Correo que se salta completo (ej. ZIP demasiado grande) y se etiqueta como Otros. */
+var SkipThreadError = function(type, detail) {
+  this.skipThread = true;
+  this.type = type;
+  this.message = detail;
 };
 
 function timeLeftMs() {
@@ -149,6 +161,7 @@ function processDTEAttachments() {
 
   try {
     Logger.log('>>> [INICIO] Ejecutando motor DTE');
+    checkInterruptedThread();
 
     var stepStart = new Date().getTime();
     var allLabels = setupLabels();
@@ -201,15 +214,19 @@ function processDTEAttachments() {
         var labeled = false;
         var threadStart = new Date().getTime();
         var filesBefore = stats.files;
+        CURRENT_THREAD_ID = thread.getId();
+        CURRENT_THREAD_MARKED = false;
+        ctx.threadTimeouts = 0;
         try {
           labeled = processThread(thread, ctx, stats);
-          clearThreadTimeouts(thread);
+          if (ctx.threadTimeouts > 0) clearThreadTimeouts(CURRENT_THREAD_ID);
           Logger.log(position + ' "' + thread.getFirstMessageSubject() + '" -> ' + getLabelPath(ctx.lastLabel) +
             (stats.files > filesBefore ? ' | Guardados: ' + (stats.files - filesBefore) : '') +
             (labeled ? '' : ' | ⚠️ NO SE PUDO ETIQUETAR') + ' | ' + secondsSince(threadStart));
         } catch (threadErr) {
           if (threadErr.timeUp) {
             // Lo guardado hasta aquí no se duplica: el anti-duplicados lo omite al reintentar.
+            markThreadEnd();
             registerThreadTimeout(thread, new Date().getTime() - threadStart);
             stats.executionStopped = true;
             break pageLoop;
@@ -219,6 +236,7 @@ function processDTEAttachments() {
           logToErrorSheet(errorLogSheet, 'Error procesando hilo', thread.getFirstMessageSubject(),
             { from: '', subject: thread.getFirstMessageSubject(), permalink: thread.getPermalink() }, threadErr.toString());
         }
+        markThreadEnd();
         if (!labeled) offset++;
       }
 
@@ -255,30 +273,33 @@ function processThread(thread, ctx, stats) {
     return applyThreadLabel(thread, ctx.labels, ctx.lastLabel);
   }
 
-  if (getThreadTimeouts(thread) >= CONFIG.MAX_THREAD_TIMEOUTS) {
-    logToErrorSheet(ctx.errorLogSheet, 'Hilo demasiado largo', thread.getFirstMessageSubject(),
-      { from: threadMessages[0].getFrom(), subject: thread.getFirstMessageSubject(), permalink: thread.getPermalink() },
+  var skipSource = { from: threadMessages[0].getFrom(), subject: thread.getFirstMessageSubject(), permalink: thread.getPermalink() };
+  ctx.threadTimeouts = getThreadTimeouts(thread.getId());
+  if (ctx.threadTimeouts >= CONFIG.MAX_THREAD_TIMEOUTS) {
+    return skipThread(thread, ctx, stats, skipSource, 'Hilo demasiado largo',
       'Agotó el tiempo de ejecución ' + CONFIG.MAX_THREAD_TIMEOUTS + ' veces. Revisar manualmente.');
-    stats.failed++;
-    ctx.lastLabel = CONFIG.FOLDER_NO_PROCESADO;
-    return applyThreadLabel(thread, ctx.labels, ctx.lastLabel);
   }
 
   var threadPermalink = thread.getPermalink();
   var records = [];
   ctx.threadCodeMeta = {};
 
-  threadMessages.forEach(function(message) {
-    ensureTime(0);
-    var threadData = {
-      subject: message.getSubject(),
-      from: message.getFrom(),
-      date: message.getDate(),
-      permalink: threadPermalink
-    };
-    var assets = expandAttachments(message.getAttachments(), threadData, ctx.errorLogSheet);
-    records = records.concat(analyzeMessage(message, assets, threadData, ctx));
-  });
+  try {
+    threadMessages.forEach(function(message) {
+      ensureTime(0);
+      var threadData = {
+        subject: message.getSubject(),
+        from: message.getFrom(),
+        date: message.getDate(),
+        permalink: threadPermalink
+      };
+      var assets = expandAttachments(message.getAttachments(), threadData, ctx.errorLogSheet);
+      records = records.concat(analyzeMessage(message, assets, threadData, ctx));
+    });
+  } catch (e) {
+    if (!e.skipThread) throw e;
+    return skipThread(thread, ctx, stats, skipSource, e.type, e.message);
+  }
 
   if (records.length > 0) {
     var baseThreadData = {
@@ -299,21 +320,61 @@ function processThread(thread, ctx, stats) {
   return applyThreadLabel(thread, ctx.labels, ctx.lastLabel);
 }
 
+/** Deja el correo en Otros sin procesarlo y lo anota en el log para revisión manual. */
+function skipThread(thread, ctx, stats, source, type, detail) {
+  Logger.log(CURRENT_THREAD_TAG + ' [SALTADO] "' + source.subject + '": ' + detail);
+  logToErrorSheet(ctx.errorLogSheet, type, source.subject, source, detail + ' Se etiquetó como Otros.');
+  stats.others++;
+  ctx.lastLabel = CONFIG.LABEL_OTROS;
+  return applyThreadLabel(thread, ctx.labels, ctx.lastLabel);
+}
+
 /** Veces que un hilo agotó el tiempo (en Propiedades del script). */
-function getThreadTimeouts(thread) {
-  return Number(PropertiesService.getScriptProperties().getProperty('timeout_' + thread.getId()) || 0);
+function getThreadTimeouts(threadId) {
+  return Number(PropertiesService.getScriptProperties().getProperty('timeout_' + threadId) || 0);
+}
+
+function addThreadTimeout(threadId) {
+  PropertiesService.getScriptProperties().setProperty('timeout_' + threadId, String(getThreadTimeouts(threadId) + 1));
 }
 
 /** Solo cuenta si el propio hilo consumió tiempo (no si empezó cuando ya quedaba poco). */
 function registerThreadTimeout(thread, elapsedMs) {
   Logger.log('>>> [TIEMPO] Se agotó el tiempo en: "' + thread.getFirstMessageSubject() + '" (' + Math.round(elapsedMs / 1000) + ' s)');
-  if (elapsedMs < 60 * 1000) return;
-  PropertiesService.getScriptProperties().setProperty('timeout_' + thread.getId(), String(getThreadTimeouts(thread) + 1));
+  if (elapsedMs >= 60 * 1000) addThreadTimeout(thread.getId());
 }
 
-function clearThreadTimeouts(thread) {
+function clearThreadTimeouts(threadId) {
   var props = PropertiesService.getScriptProperties();
-  if (props.getProperty('timeout_' + thread.getId())) props.deleteProperty('timeout_' + thread.getId());
+  if (props.getProperty('timeout_' + threadId)) props.deleteProperty('timeout_' + threadId);
+}
+
+/**
+ * Se anota el hilo en curso antes de las operaciones que pueden colgarse (adjuntos y enlaces).
+ * Si Google corta la ejecución a la fuerza (6 min) la marca queda, y la siguiente ejecución lo
+ * cuenta como intento fallido para no quedarse pegada en él. Los correos sin adjuntos ni enlaces
+ * no escriben nada.
+ */
+function markThreadStart() {
+  if (CURRENT_THREAD_MARKED || !CURRENT_THREAD_ID) return;
+  PropertiesService.getScriptProperties().setProperty('dte_hilo_en_curso', CURRENT_THREAD_ID);
+  CURRENT_THREAD_MARKED = true;
+}
+
+function markThreadEnd() {
+  if (!CURRENT_THREAD_MARKED) return;
+  PropertiesService.getScriptProperties().deleteProperty('dte_hilo_en_curso');
+  CURRENT_THREAD_MARKED = false;
+}
+
+function checkInterruptedThread() {
+  var props = PropertiesService.getScriptProperties();
+  var threadId = props.getProperty('dte_hilo_en_curso');
+  if (!threadId) return;
+  addThreadTimeout(threadId);
+  props.deleteProperty('dte_hilo_en_curso');
+  Logger.log('>>> [TIEMPO] La ejecución anterior se cortó procesando un correo; se cuenta como intento fallido (' +
+    getThreadTimeouts(threadId) + ' de ' + CONFIG.MAX_THREAD_TIMEOUTS + ').');
 }
 
 /**
@@ -333,6 +394,11 @@ function expandAttachments(rawAttachments, threadData, errorLogSheet) {
 
     if (isZipAttachment(blob, fmt)) {
       if (depth > 2) return;
+      var sizeMb = getBlobSize(blob) / (1024 * 1024);
+      if (sizeMb > CONFIG.MAX_ZIP_SIZE_MB) {
+        throw new SkipThreadError('ZIP demasiado grande', 'El ZIP "' + name + '" pesa ' + sizeMb.toFixed(1) +
+          ' MB (máximo ' + CONFIG.MAX_ZIP_SIZE_MB + ' MB): no se descomprime por el límite de tiempo de Google.');
+      }
       try {
         Utilities.unzip(blob).forEach(function(inner) { addBlob(inner, depth + 1, dir + name + '/'); });
       } catch (zipErr) {
@@ -347,8 +413,16 @@ function expandAttachments(rawAttachments, threadData, errorLogSheet) {
     }
   }
 
+  if (rawAttachments.length > 0) markThreadStart();
   rawAttachments.forEach(function(att) { addBlob(att, 0, ''); });
   return assets;
+}
+
+function getBlobSize(blob) {
+  try {
+    if (typeof blob.getSize === 'function') return blob.getSize();
+  } catch (e) {}
+  return blob.getBytes().length;
 }
 
 /** ZIP por extensión, por tipo de contenido o, si no tiene extensión conocida, por su firma. */
@@ -688,6 +762,11 @@ function noProcesadoClassification() {
   return { name: CONFIG.FOLDER_NO_PROCESADO, type: 'DTE', label: CONFIG.FOLDER_NO_PROCESADO };
 }
 
+/** DTE válido cuyo NIT/DUI no es de ninguna empresa: solo se etiqueta, no se guarda. */
+function noIdentificadoClassification() {
+  return { name: CONFIG.FOLDER_NO_PROCESADO, type: 'DTE', label: CONFIG.LABEL_NO_IDENTIFICADO, skipSave: true };
+}
+
 /** PDF sin JSON que no se pudo identificar: se guarda en No procesado con su propia etiqueta. */
 function soloPdfClassification() {
   return { name: CONFIG.FOLDER_NO_PROCESADO, type: 'DTE', label: CONFIG.LABEL_SOLO_PDF };
@@ -703,7 +782,7 @@ function identifyCompany(jsonData, tipoCodigo) {
     if (emisor && nitList.indexOf(emisor) !== -1) return makeClassification(COMPANIES[i], inverted ? 'Compras' : 'Ventas');
     if (receptor && nitList.indexOf(receptor) !== -1) return makeClassification(COMPANIES[i], inverted ? 'Ventas' : 'Compras');
   }
-  return noProcesadoClassification();
+  return noIdentificadoClassification();
 }
 
 // ====================================================================================
@@ -826,7 +905,7 @@ function buildOrphanRecords(asset, threadData, ctx, hasHints, fallbackClassif, m
     fecha: (known && known.fecha) || (xmlMeta && xmlMeta.fecha) || info.fecha || '',
     tipoNombre: (known && known.tipoNombre) || (xmlMeta && xmlMeta.tipoNombre) || getTipoNombre(info.tipoCodigo),
     classif: (known && known.classif) || xmlClassif || identifyCompanyFromNits(info.nits) || fallbackClassif ||
-      (asset.fmt === 'pdf' ? soloPdfClassification() : noProcesadoClassification())
+      (asset.fmt === 'pdf' ? soloPdfClassification() : noIdentificadoClassification())
   };
   if (xmlMeta) rememberCodeMeta(ctx, meta);
 
@@ -883,6 +962,7 @@ function extractCandidateLinks(message) {
 function fetchUrlCached(url, cache) {
   if (Object.prototype.hasOwnProperty.call(cache, url)) return cache[url];
   ensureTime(CONFIG.FETCH_RESERVE_MS);
+  markThreadStart();
   var hostMatch = url.match(/^https?:\/\/([^\/?#:]+)/i);
   Logger.log(CURRENT_THREAD_TAG + ' Revisando enlace externo: ' + (hostMatch ? hostMatch[1] : url));
   var out;
@@ -1014,7 +1094,7 @@ function createRecord(asset, t, meta, extUrl) {
     fechaEmision: meta.fecha || '',
     codigo: meta.codigo || extractGuidFromName(asset.name),
     companyName: classif.name, classType: classif.type, typeLabel: classif.label,
-    tipoDoc: meta.tipoNombre || ''
+    tipoDoc: meta.tipoNombre || '', skipSave: !!classif.skipSave
   };
 }
 
@@ -1036,7 +1116,7 @@ function buildMissingCounterpartRecord(t, meta, missingFormat, receivedFileName,
     fechaEmision: meta.fecha || '',
     codigo: meta.codigo || extractGuidFromName(receivedFileName),
     companyName: classif.name, classType: classif.type, typeLabel: classif.label,
-    tipoDoc: meta.tipoNombre || '',
+    tipoDoc: meta.tipoNombre || '', skipSave: !!classif.skipSave,
     isMissing: true,
     counterpartOf: received,
     missingDetail: detail || ''
@@ -1056,6 +1136,7 @@ function saveThreadData(ctx, records, threadData) {
   var folderCache = {};
 
   records.forEach(function(r) {
+    if (r.skipSave) return;
     ensureTime(0);
     var config = findConfig(ctx.configs, r.companyName);
     if (!config) return;
@@ -1341,6 +1422,7 @@ function getClassificationLabelNames() {
   });
   names.push(CONFIG.FOLDER_NO_PROCESADO);
   names.push(CONFIG.LABEL_SOLO_PDF);
+  names.push(CONFIG.LABEL_NO_IDENTIFICADO);
   names.push(CONFIG.LABEL_OTROS);
   return names;
 }
@@ -1380,13 +1462,15 @@ function threadHasOwnLabel(thread, allLabels) {
 }
 
 /**
- * Etiqueta única del hilo, para revisión manual primero: No procesado si algún DTE no se asignó a una
- * empresa; Solo PDF si lo pendiente son PDF sin JSON; si no, la empresa/tipo con más archivos
- * (en empate, el primero). Otros si no hay DTE.
+ * Etiqueta única del hilo, para revisión manual primero: No identificado si algún DTE tiene un NIT/DUI
+ * que no es de ninguna empresa; No procesado si algún DTE no se asignó por otro motivo; Solo PDF si lo
+ * pendiente son PDF sin JSON; si no, la empresa/tipo con más archivos (en empate, el primero).
+ * Otros si no hay DTE.
  */
 function resolveThreadLabel(records) {
   if (records.length === 0) return CONFIG.LABEL_OTROS;
   var pending = records.filter(function(r) { return r.classType === 'DTE'; });
+  if (pending.some(function(r) { return r.typeLabel === CONFIG.LABEL_NO_IDENTIFICADO; })) return CONFIG.LABEL_NO_IDENTIFICADO;
   if (pending.some(function(r) { return r.typeLabel !== CONFIG.LABEL_SOLO_PDF; })) return CONFIG.FOLDER_NO_PROCESADO;
   if (pending.length > 0) return CONFIG.LABEL_SOLO_PDF;
   var counts = {};

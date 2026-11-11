@@ -32,12 +32,13 @@ Archivo del script: [`Extraer DTE de correos v3.txt`](Extraer%20DTE%20de%20corre
                ├── Compras - <Empresa>/
                └── Ventas - <Empresa>/
    ```
-   Lo que no se identifica va a la carpeta y hoja `No procesado`.
+   Los PDF sin JSON que no se pueden identificar van a la carpeta y hoja `No procesado`. Los DTE con un NIT/DUI que no es de ninguna empresa configurada **no se guardan** en Drive ni en hojas: solo se etiqueta el correo como `DTE/No identificado`.
 10. **Pone una sola etiqueta por correo en Gmail**, dentro de `DTE/`. Las etiquetas propias del cliente no se modifican.
 
     | Etiqueta | Cuándo se aplica |
     |---|---|
-    | `DTE/No procesado` | Algún JSON o XML del correo no se pudo asignar a una empresa (queda para revisión manual) |
+    | `DTE/No identificado` | Algún DTE del correo se leyó bien pero su NIT/DUI no es de ninguna empresa configurada. No se guarda: se revisa directamente en el correo |
+    | `DTE/No procesado` | Algún DTE no se pudo asignar por otro motivo (por ejemplo, su JSON ya estaba en la hoja No procesado de versiones anteriores) |
     | `DTE/Solo PDF` | Lo único pendiente son PDF sin su JSON que no se pudieron identificar (revisión manual) |
     | `DTE/<Empresa>-Compras` / `-Ventas` | Todos los documentos son de una empresa configurada; si hay de varias, gana la que tiene más archivos |
     | `DTE/Otros` | El correo no contiene ningún DTE |
@@ -66,7 +67,8 @@ Archivo del script: [`Extraer DTE de correos v3.txt`](Extraer%20DTE%20de%20corre
 
 - Un bloqueo impide que corran dos ejecuciones a la vez.
 - **Límite de tiempo:** Google detiene cualquier ejecución a los 6 minutos. El script deja de empezar trabajo nuevo a los 4 minutos, revisa el tiempo también dentro de cada correo y no abre enlaces si queda menos de 1 minuto. Lo que falte continúa en la siguiente ejecución, y el anti-duplicados evita repetir lo que ya se guardó.
-- Si un mismo correo agota el tiempo 2 veces, se etiqueta `DTE/No procesado` y se anota en el log como "Hilo demasiado largo", para que no bloquee las siguientes ejecuciones.
+- **ZIP grandes:** un ZIP de más de 5 MB (`MAX_ZIP_SIZE_MB`) no se descomprime, porque podría consumir todo el tiempo de la ejecución. El correo se etiqueta `DTE/Otros` y queda en el log como "ZIP demasiado grande" para revisarlo a mano.
+- **Correos que se cuelgan:** si un mismo correo agota el tiempo 2 veces (incluso si Google corta la ejecución a la fuerza), se etiqueta `DTE/Otros` y se anota en el log como "Hilo demasiado largo", para que no bloquee las siguientes ejecuciones.
 - Un correo con error se anota en el log y no detiene el resto.
 - Si falla la escritura en la hoja, reintenta. Si aun así falla, quita de Drive el archivo que no quedó registrado.
 
