@@ -387,7 +387,7 @@ function expandAttachments(rawAttachments, threadData, errorLogSheet) {
   function addBlob(blob, depth, parentDir) {
     var fullName = (blob.getName() || '').toString();
     var name = cleanFileName(fullName);
-    var fmt = getExt(name);
+    var fmt = detectFormat(blob, name);
     var dir = parentDir + fullName.substring(0, fullName.length - name.length);
 
     if (!name || isJunkZipEntry(fullName)) return;
@@ -408,7 +408,14 @@ function expandAttachments(rawAttachments, threadData, errorLogSheet) {
     }
 
     if (fmt === 'json' || fmt === 'pdf' || fmt === 'xml') {
-      if (depth > 0) blob.setName(name);
+      if (getExt(name) !== fmt) {
+        // Archivo enviado sin extensión: se le agrega para guardarlo bien en Drive.
+        name = name + '.' + fmt;
+        blob = blob.copyBlob ? blob.copyBlob() : blob;
+        blob.setName(name);
+      } else if (depth > 0) {
+        blob.setName(name);
+      }
       assets.push({ blob: blob, name: name, fmt: fmt, dir: dir });
     }
   }
@@ -416,6 +423,33 @@ function expandAttachments(rawAttachments, threadData, errorLogSheet) {
   if (rawAttachments.length > 0) markThreadStart();
   rawAttachments.forEach(function(att) { addBlob(att, 0, ''); });
   return assets;
+}
+
+/**
+ * Formato del archivo: por su extensión; si no la trae (algunos emisores envían los DTE sin
+ * extensión), por el tipo de contenido o por los primeros bytes (%PDF, PK, {, <?xml).
+ */
+function detectFormat(blob, name) {
+  var ext = getExt(name);
+  if (['json', 'pdf', 'xml', 'zip'].indexOf(ext) !== -1) return ext;
+
+  var type = '';
+  try { type = (blob.getContentType() || '').toLowerCase(); } catch (e) {}
+  if (type.indexOf('pdf') !== -1) return 'pdf';
+  if (type.indexOf('json') !== -1) return 'json';
+  if (type.indexOf('zip') !== -1) return 'zip';
+
+  if (/\.[a-z0-9]{1,5}$/i.test(name)) return ext;
+  var head = '';
+  try {
+    head = blob.getBytes().slice(0, 64).map(function(b) { return String.fromCharCode(b & 0xFF); }).join('')
+      .replace(/^\xEF\xBB\xBF/, '').replace(/^\s+/, '');
+  } catch (e) {}
+  if (head.indexOf('%PDF') === 0) return 'pdf';
+  if (head.indexOf('PK') === 0) return 'zip';
+  if (head.charAt(0) === '{' || head.charAt(0) === '[') return 'json';
+  if (head.indexOf('<?xml') === 0) return 'xml';
+  return ext;
 }
 
 function getBlobSize(blob) {

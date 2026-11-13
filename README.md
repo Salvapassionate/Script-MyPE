@@ -9,7 +9,7 @@ Archivo del script: [`Extraer DTE de correos v3.txt`](Extraer%20DTE%20de%20corre
 ## ¿Qué hace?
 
 1. **Busca correos en todo el buzón**: recibidos, archivados y enviados, de cualquier fecha. No revisa spam, papelera, chats ni borradores. Omite los correos que ya tienen una etiqueta `DTE/…`. Recorre el buzón por páginas: si no termina en una ejecución, la siguiente continúa donde quedó.
-2. **Toma los adjuntos JSON, PDF y XML**, también los que vienen dentro de un ZIP. Detecta los ZIP aunque no tengan extensión, abre los ZIP que vienen dentro de otro ZIP y descarta los archivos ocultos que agregan Mac o Windows.
+2. **Toma los adjuntos JSON, PDF y XML**, también los que vienen dentro de un ZIP. Detecta los ZIP aunque no tengan extensión, abre los ZIP que vienen dentro de otro ZIP y descarta los archivos ocultos que agregan Mac o Windows. Si un emisor envía el PDF o el JSON **sin extensión** (por ejemplo `8A74C2C2-…541B` y `8A74C2C2-…541B_1`), reconoce el formato por el tipo de archivo o por su contenido y lo guarda en Drive con la extensión correcta.
 3. **Clasifica cada documento por separado** según el NIT, aunque un correo o un ZIP mezcle compras, ventas y documentos de otras empresas:
    - Si la empresa es la que emite el documento, es **Venta**; si es la que lo recibe, es **Compra**.
    - En la Factura de Sujeto Excluido (tipo 14) es al revés, porque la emite quien compra.
